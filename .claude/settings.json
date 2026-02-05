@@ -1,0 +1,126 @@
+{
+  "name": "TrendLab",
+  "description": "TrendLab v3 \u2014 Rust backtesting research platform (TUI + realistic execution)",
+  "version": "3.2.0",
+  "commands": {
+    "architecture": {
+      "description": "System architecture decisions, module boundaries, invariants",
+      "prompt_file": "commands/architecture.md"
+    },
+    "signals": {
+      "description": "Signal generator design (pure, vectorizable, exposure output)",
+      "prompt_file": "commands/signals.md"
+    },
+    "orders": {
+      "description": "Order types, order policy (synthesis), and order book state machine",
+      "prompt_file": "commands/orders.md"
+    },
+    "execution": {
+      "description": "Execution model (fills, intrabar path policy, slippage/adverse selection)",
+      "prompt_file": "commands/execution.md"
+    },
+    "position-mgmt": {
+      "description": "Position management (stops, trailing, targets, scaling) without stickiness",
+      "prompt_file": "commands/position-mgmt.md"
+    },
+    "robustness": {
+      "description": "Validation pipeline: walk-forward, MC, bootstrap, regime tests",
+      "prompt_file": "commands/robustness.md"
+    },
+    "benchmark": {
+      "description": "Performance optimization, profiling, benchmarks, perf regression",
+      "prompt_file": "commands/benchmark.md"
+    },
+    "data": {
+      "description": "Data ingest/cache/adjustments, missing data, alignment, survivorship",
+      "prompt_file": "commands/data.md"
+    },
+    "testing": {
+      "description": "Testing strategy: unit/integration/proptest/golden tests & invariants",
+      "prompt_file": "commands/testing.md"
+    }
+  },
+  "context": {
+    "include": [
+      "src/**/*.rs",
+      "crates/**/src/**/*.rs",
+      "Cargo.toml",
+      "Cargo.lock",
+      "README.md",
+      ".cargo/config.toml",
+      "docs/**/*.md"
+    ],
+    "exclude": [
+      "target/**",
+      "data/**",
+      "datasets/**",
+      "results/**",
+      "**/*.parquet",
+      "**/*.csv",
+      "**/*.jsonl",
+      ".git/**"
+    ]
+  },
+  "preferences": {
+    "language": "rust",
+    "framework": "ratatui",
+    "data_library": "polars",
+    "parallelism": "rayon",
+    "error_handling": "thiserror + anyhow",
+    "testing": "criterion + proptest + insta (goldens)"
+  },
+  "agents": {
+    "rust-expert": {
+      "description": "Rust architecture + APIs + ergonomics + correctness",
+      "file": "agents/rust-expert.md"
+    },
+    "ratatui-expert": {
+      "description": "Ratatui UI systems + layout + input + perf",
+      "file": "agents/ratatui-expert.md"
+    },
+    "aesthetic-designer": {
+      "description": "Parrot/neon theme tokens + typography + widgets + progress bars",
+      "file": "agents/aesthetic-designer.md"
+    },
+    "trend-following-strategist": {
+      "description": "Strategy design, evaluation, pitfalls, robustness",
+      "file": "agents/trend-following-strategist.md"
+    },
+    "execution-engineer": {
+      "description": "Order book + fill simulation + intrabar policies",
+      "file": "agents/execution-engineer.md"
+    },
+    "quant-validator": {
+      "description": "Overfitting defenses, statistics, walk-forward/MC/bootstrap",
+      "file": "agents/quant-validator.md"
+    },
+    "data-hygiene": {
+      "description": "Data ingest/clean/adjust/cache + survivorship handling",
+      "file": "agents/data-hygiene.md"
+    },
+    "test-engineer": {
+      "description": "Unit/integration/proptest/golden tests + invariants",
+      "file": "agents/test-engineer.md"
+    },
+    "performance-engineer": {
+      "description": "Profiling + allocation discipline + benchmarks + scaling",
+      "file": "agents/performance-engineer.md"
+    },
+    "product-ux": {
+      "description": "Workflow design + keybindings + information architecture",
+      "file": "agents/product-ux.md"
+    },
+    "polars-expert": {
+      "description": "Polars feature engineering + caching + alignment",
+      "file": "agents/polars-expert.md"
+    },
+    "optimization-sweeper": {
+      "description": "Structural explore + parameter sampling + promotion ladder scheduling",
+      "file": "agents/optimization-sweeper.md"
+    },
+    "reporting-artifacts": {
+      "description": "Run manifests, artifacts, and reproducible reporting",
+      "file": "agents/reporting-artifacts.md"
+    }
+  }
+}
