@@ -1,0 +1,10 @@
+[package]
+name = "trendlab-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trendlab-core = { path = "../trendlab-core" }
+trendlab-runner = { path = "../trendlab-runner" }
+ratatui.workspace = true
+crossterm.workspace = true

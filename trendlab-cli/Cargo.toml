@@ -1,0 +1,10 @@
+[package]
+name = "trendlab-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trendlab-core = { path = "../trendlab-core" }
+trendlab-runner = { path = "../trendlab-runner" }
+clap = { version = "4.0", features = ["derive"] }
+anyhow.workspace = true

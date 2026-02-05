@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo new:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(findstr:*)",
+      "Bash(for f in mod.rs intent.rs manager.rs ratchet.rs strategies/mod.rs strategies/*.rs)",
+      "Bash(do sed -i '/^\\\\/\\\\/\\\\//{ N; s/\\\\/\\\\/\\\\/.*\\\\n$/&/; }' \"$f\")",
+      "Bash(done)"
+    ]
+  }
+}

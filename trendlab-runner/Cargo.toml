@@ -1,0 +1,20 @@
+[package]
+name = "trendlab-runner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trendlab-core = { path = "../trendlab-core" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+polars.workspace = true
+blake3.workspace = true
+rayon = "1.10"
+
+[dev-dependencies]
+cucumber = "0.21"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3.10"

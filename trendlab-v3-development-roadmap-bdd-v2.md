@@ -32,6 +32,24 @@ This section documents critical architectural decisions to prevent contradiction
 - **Dataset Hashing:** Sampled BLAKE3 content hash (not proxy hash)
   - Hash schema + row count + sampled rows (first/last/evenly-spaced)
   - Detects "mutate the middle" cache invalidation scenarios
+  - **Canonicalization rules** (mandatory for stable hashing):
+    1. Column ordering: alphabetical by column name
+    2. Numeric precision: round f64 to 6 decimal places before hashing
+    3. Timezone normalization: all timestamps converted to UTC
+    4. NaN handling: replace NaN with explicit sentinel value (e.g., -999999.0) before hash
+    5. String case: symbol names uppercased
+- **Deterministic Iteration Guardrail:**
+  - `HashMap` allowed for O(1) lookup (e.g., symbol → price, OrderId → Order)
+  - **Critical rule:** Any iteration that affects fill outcomes MUST sort by deterministic key (timestamp, order_id)
+  - Example: `order_book.values().collect()` → sort by `(created_bar, order_id)` before processing
+  - Prevents nondeterminism from HashMap iteration order changes across builds
+- **Liquidity Allocation Rule:** **Time-Priority (FIFO)** is the canonical v3 allocation
+  - Rationale: simple, realistic (matches most exchanges), deterministic
+  - Algorithm: documented in M5
+  - Future work: configurable policies (pro-rata, priority tiers) post-v3
+- **Intrabar Bracket Activation:** Activation Step occurs immediately after parent fills
+  - Documented in M4 micro-timeline
+  - Children can fill in same bar as parent (after activation step)
 
 ### Open Decisions (to be finalized in implementation)
 
@@ -39,11 +57,6 @@ This section documents critical architectural decisions to prevent contradiction
   - `DatasetHashFast` (sampled) for dev sweeps
   - `DatasetHashStrict` (full scan) for publish/leaderboard runs
   - Record mode in manifest
-- **Liquidity Allocation Rule:** When multiple orders compete for limited bar volume:
-  - Options: pro-rata, time-priority, priority tiers (stops/limits/market)
-  - **Decision: Time-Priority (FIFO)** — documented in M5
-- **Intrabar Bracket Activation:** Exact timing when bracket children become active
-  - **Decision: Activation Step after parent fills** — documented in M4
 
 ---
 
@@ -108,6 +121,10 @@ M0 ─── M0.5 ─┬─ M1 (domain + instrument)
 4. **Property Test:** "Stop gapped through fills at open (worse price)"
 5. **Concurrency Test:** Run with 1, 4, 16 threads → bit-for-bit identical equity
 6. **Numeric Determinism Test:** Same seed → identical fill prices, equity, trade sequence
+7. **Cross-Platform Reproducibility Test (Definition of Done):**
+   - Run identical config + dataset + seed on two different machines (e.g., Linux, Windows)
+   - Verify RunId hash, manifest, final equity, fill sequence are byte-for-byte identical
+   - This enforces: no platform-dependent iteration order, no DefaultHasher, stable BLAKE3 usage
 
 (No real signals/PM required yet.)
 
@@ -3043,7 +3060,7 @@ trendlab-core/src/
 
 ### Intrabar Micro-Timeline (Canonical Execution Order)
 
-This defines the exact sub-step ordering within a single bar to eliminate ambiguity.
+**⚠️ SOURCE OF TRUTH:** This section defines the exact sub-step ordering within a single bar to eliminate ambiguity. All other sections describing intrabar execution (M3, M5, M6) reference this canonical spec.
 
 **Sub-Steps (executed in order):**
 
@@ -4511,10 +4528,10 @@ Result:
   - Optional: partial fill probability / queue depth simulation
 - **Liquidity constraint (optional)**:
   - Participation limit (% of bar volume)
-  - **Competing orders rule**: If multiple orders on same symbol want fills, allocate by:
-    - Priority order (then subtract remaining volume), OR
-    - Pro-rata by requested qty, OR
-    - Time priority (order age)
+  - **Competing orders rule**: **Time-Priority (FIFO)** allocation (canonical)
+    - Orders fill in submission timestamp order until volume exhausted
+    - Algorithm documented in "Liquidity Allocation Rule (Canonical)" section below
+    - Future work: configurable policies (pro-rata, priority tiers) as post-v3 enhancement
   - Remainder policy: Carry, Cancel, PartialFill
   - **Slippage-to-volume scaling**: as order consumes larger % of bar volume, slippage increases non-linearly
 
@@ -7067,6 +7084,51 @@ cargo run --package trendlab-runner --bin sweep -- \
 - Scenario: leaderboard row reruns identically from manifest
 
 **Full scenarios and implementation:** [M8-walkforward-oos-specification.md](M8-walkforward-oos-specification.md)
+
+---
+
+## M8 Implementation Status (2026-02-04)
+
+**Status:** ✅ IMPLEMENTED (Simplified/Foundation)
+
+**What was built:**
+
+- ✅ `trendlab-runner` crate structure
+- ✅ `RunConfig`: Serializable backtest configuration with deterministic hashing (BLAKE3)
+- ✅ `BacktestResult`: Equity curve, trade log, performance statistics (Sharpe, Sortino, Calmar, etc.)
+- ✅ `Runner`: Single backtest orchestration with optional caching
+- ✅ `ResultCache`: Parquet-based result storage with hash-based deduplication
+- ✅ `ParamSweep`: Grid search over parameter ranges with parallel execution (Rayon)
+- ✅ `Leaderboard`: Strategy ranking by configurable fitness metrics
+- ✅ 31 passing tests (25 unit + 6 BDD integration tests)
+
+**Scope Notes:**
+
+- This is a **simplified M8 foundation** that provides core runner functionality
+- Full M8 specification includes: structural sweeps, feature cache, indicator cache, warmup-to-feature sync
+- These advanced features will be implemented in future iterations as the engine matures
+- Current implementation focuses on:
+  - Single backtest execution
+  - Basic parameter sweeps (MA crossover periods)
+  - Result caching (full results, not granular feature/indicator caching)
+  - Leaderboard ranking by multiple metrics
+
+**Integration with Core Engine:**
+
+- Uses M3 `Engine` (4-phase event loop)
+- Currently uses synthetic bar data (real Parquet loading deferred to M9+)
+- Strategy components (M7 signals/PM/sizers) not yet integrated into runner (deferred to M9)
+- Current runner executes basic event loop and tracks equity
+
+**Next Steps (Future M8 Enhancement / M9):**
+
+- [ ] Integrate M7 strategy composition into runner
+- [ ] Real data loading from Parquet files
+- [ ] Structural sweeps (signals × PMs × execution presets)
+- [ ] Feature cache (dataset_hash + spec_id)
+- [ ] Indicator cache (params → values)
+- [ ] Warmup-to-feature automatic sync
+- [ ] Advanced cache invalidation rules
 
 ---
 
