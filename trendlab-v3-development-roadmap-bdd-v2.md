@@ -16,6 +16,37 @@ Keep Gherkin scenarios small and focused on *behavior*, not implementation.
 
 ---
 
+## Decision Log (Load-Bearing Choices)
+
+This section documents critical architectural decisions to prevent contradictions during implementation.
+
+### Finalized Decisions
+
+- **Deterministic Hashing:** BLAKE3 for all IDs (RunId, ConfigId, DatasetHash)
+  - NO `DefaultHasher` anywhere in ID generation
+  - Ensures cross-platform/cross-build stability
+- **Deterministic Collections:** `BTreeSet`/`BTreeMap` for any structure participating in:
+  - Hashing/manifests
+  - Deterministic iteration
+  - Universe symbol sets
+- **Dataset Hashing:** Sampled BLAKE3 content hash (not proxy hash)
+  - Hash schema + row count + sampled rows (first/last/evenly-spaced)
+  - Detects "mutate the middle" cache invalidation scenarios
+
+### Open Decisions (to be finalized in implementation)
+
+- **Dataset Hash Modes:**
+  - `DatasetHashFast` (sampled) for dev sweeps
+  - `DatasetHashStrict` (full scan) for publish/leaderboard runs
+  - Record mode in manifest
+- **Liquidity Allocation Rule:** When multiple orders compete for limited bar volume:
+  - Options: pro-rata, time-priority, priority tiers (stops/limits/market)
+  - **Decision: Time-Priority (FIFO)** — documented in M5
+- **Intrabar Bracket Activation:** Exact timing when bracket children become active
+  - **Decision: Activation Step after parent fills** — documented in M4
+
+---
+
 ## Dependency graph (explicit)
 
 ```
@@ -58,21 +89,51 @@ M0 ─── M0.5 ─┬─ M1 (domain + instrument)
 
 ## Integration checkpoints (planned)
 
-### Checkpoint A (after M5)
-- Synthetic end-to-end backtest works
-- Order book + execution realism works
-- Accounting correct  
+### Checkpoint A (after M5) — Determinism & Execution Realism
+
+**Non-Negotiable Tests (all must pass):**
+
+1. **Golden Test:** 10-bar smoke run equals known equity ($10,009.09 from M0.5)
+2. **Property Test:** "No negative cash unless margin enabled"
+   ```rust
+   proptest! {
+       fn no_negative_cash_without_margin(run: BacktestRun) {
+           if !run.config.margin_enabled {
+               assert!(run.portfolio.cash >= 0.0);
+           }
+       }
+   }
+   ```
+3. **Property Test:** "OCO invariant: sibling cancels only after full fill"
+4. **Property Test:** "Stop gapped through fills at open (worse price)"
+5. **Concurrency Test:** Run with 1, 4, 16 threads → bit-for-bit identical equity
+6. **Numeric Determinism Test:** Same seed → identical fill prices, equity, trade sequence
+
 (No real signals/PM required yet.)
 
-### Checkpoint B (after M8)
-- Full-Auto sweeps run and persist leaderboards
-- Any leaderboard row is reproducible from manifest  
+### Checkpoint B (after M8) — Persistence & Cache Integrity
+
+**Non-Negotiable Tests:**
+
+1. **Cache Invalidation Test:** Delete `results.cache`, rerun → exact equity reconstruction
+2. **Dataset Mutation Test:** Mutate middle bar → dataset hash MUST change → cache miss
+3. **Manifest Reproducibility Test:** Any leaderboard row reproducible from manifest
+4. **Concurrent Write Safety:** Multiple threads writing cache → no corruption
+
 (Robustness ladder can still be minimal.)
 
-### Checkpoint C (after M10)
-- Drill-down “why did this win?” works in TUI
-- Execution sensitivity + ghost curve visible
-- Ready to harden and optimize
+### Checkpoint C (after M10) — Explainability & Execution Sensitivity
+
+**Non-Negotiable Tests:**
+
+1. **Death Crossing Analysis:** Flag strategies where Ghost Curve (ideal) vs Real Curve diverge >15%
+   - Marks execution-fragile strategies
+   - Visible in TUI drill-down view
+2. **Rejected Intent Coverage:** Verify all 4 rejection types logged and displayable
+   - VolatilityGuard, LiquidityGuard, MarginGuard, RiskGuard
+3. **Drill-Down Completeness:** Can trace any trade back to: signal → intent → order → fill
+
+Ready to harden and optimize.
 
 ---
 
@@ -116,6 +177,7 @@ anyhow = "1.0"
 polars = { version = "0.44", features = ["lazy", "parquet"] }
 ratatui = "0.28"
 crossterm = "0.28"
+blake3 = "1.5"  # Stable deterministic hashing for RunId/DatasetHash
 ```
 
 **2. rustfmt.toml**
@@ -690,9 +752,17 @@ Include **Instrument** metadata early, even if minimal for equities.
 - Core types: `Bar`, `Order`, `Fill`, `Position`, `Portfolio`, `Trade`
 - **Instrument**:
   - tick_size, lot_size, currency, asset_class
+  - `TickPolicy` enum for rounding (Reject, RoundNearest, RoundDown, RoundUp)
+  - Side-aware rounding (buy limits round down, sell limits round up)
   - (optional now) trading calendar/trading hours hooks
 - Deterministic IDs:
-  - `ConfigId`, `DatasetHash`, `RunId`
+  - `ConfigId`, `DatasetHash`, `RunId` (using BLAKE3 for stable hashing)
+  - Canonical serialization with sorted keys
+  - `BTreeSet` for symbol universes (deterministic iteration order)
+- **Numeric types strategy**:
+  - Bar data: `f64` (practical for indicators/Polars)
+  - Execution boundary: convert to fixed-point ticks (`i64`) for fills/order prices
+  - Portfolio/PM: use `Decimal` or fixed-point for exact money accounting
 - Seed plumbing for any stochastic behavior
 
 ### File Structure
@@ -886,6 +956,25 @@ mod tests {
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Tick/lot rounding policy
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum TickPolicy {
+    /// Reject orders that aren't already tick-aligned
+    Reject,
+    /// Round to nearest tick
+    RoundNearest,
+    /// Round down (more conservative for buys)
+    RoundDown,
+    /// Round up (more conservative for sells)
+    RoundUp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum OrderSideForRounding {
+    Buy,
+    Sell,
+}
+
 /// Instrument metadata for tick size, lot size, etc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Instrument {
@@ -922,37 +1011,66 @@ impl Instrument {
         }
     }
 
-    /// Round price to nearest tick
-    pub fn round_to_tick(&self, price: f64) -> f64 {
-        let ticks = (price / self.tick_size).round();
-        ticks * self.tick_size
+    /// Round price according to policy
+    pub fn round_price(&self, price: f64, policy: TickPolicy) -> f64 {
+        let ticks = price / self.tick_size;
+        let rounded_ticks = match policy {
+            TickPolicy::RoundNearest => ticks.round(),
+            TickPolicy::RoundDown => ticks.floor(),
+            TickPolicy::RoundUp => ticks.ceil(),
+            TickPolicy::Reject => ticks, // will be checked later
+        };
+        rounded_ticks * self.tick_size
+    }
+
+    /// Apply side-aware rounding (buy limits round down, sell limits round up)
+    pub fn round_price_side_aware(
+        &self,
+        price: f64,
+        side: OrderSideForRounding,
+    ) -> f64 {
+        let policy = match side {
+            OrderSideForRounding::Buy => TickPolicy::RoundDown,
+            OrderSideForRounding::Sell => TickPolicy::RoundUp,
+        };
+        self.round_price(price, policy)
     }
 
     /// Validate price respects tick size
-    pub fn validate_price(&self, price: f64) -> Result<f64, InstrumentError> {
-        let rounded = self.round_to_tick(price);
-        if (price - rounded).abs() > 1e-10 {
-            Err(InstrumentError::InvalidTickSize {
-                price,
-                tick_size: self.tick_size,
-            })
-        } else {
-            Ok(rounded)
+    pub fn validate_price(&self, price: f64, policy: TickPolicy) -> Result<f64, InstrumentError> {
+        let rounded = self.round_price(price, policy);
+
+        if policy == TickPolicy::Reject {
+            if (price - rounded).abs() > 1e-10 {
+                return Err(InstrumentError::InvalidTickSize {
+                    price,
+                    tick_size: self.tick_size,
+                });
+            }
         }
+        Ok(rounded)
     }
 
     /// Validate quantity respects lot size
-    pub fn validate_quantity(&self, qty: f64) -> Result<f64, InstrumentError> {
-        let lots = (qty / self.lot_size).round();
-        let rounded = lots * self.lot_size;
-        if (qty - rounded).abs() > 1e-10 {
-            Err(InstrumentError::InvalidLotSize {
-                quantity: qty,
-                lot_size: self.lot_size,
-            })
-        } else {
-            Ok(rounded)
+    pub fn validate_quantity(&self, qty: f64, policy: TickPolicy) -> Result<f64, InstrumentError> {
+        let lots = qty / self.lot_size;
+        let rounded_lots = match policy {
+            TickPolicy::RoundNearest => lots.round(),
+            TickPolicy::RoundDown => lots.floor(),
+            TickPolicy::RoundUp => lots.ceil(),
+            TickPolicy::Reject => lots,
+        };
+        let rounded = rounded_lots * self.lot_size;
+
+        if policy == TickPolicy::Reject {
+            if (qty - rounded).abs() > 1e-10 {
+                return Err(InstrumentError::InvalidLotSize {
+                    quantity: qty,
+                    lot_size: self.lot_size,
+                });
+            }
         }
+        Ok(rounded)
     }
 }
 
@@ -978,8 +1096,23 @@ mod tests {
             "USD".into(),
             AssetClass::Equity,
         );
-        assert_eq!(inst.round_to_tick(100.126), 100.13);
-        assert_eq!(inst.round_to_tick(100.124), 100.12);
+        assert_eq!(inst.round_price(100.126, TickPolicy::RoundNearest), 100.13);
+        assert_eq!(inst.round_price(100.124, TickPolicy::RoundNearest), 100.12);
+    }
+
+    #[test]
+    fn test_side_aware_rounding() {
+        let inst = Instrument::new(
+            "ES".into(),
+            0.25,
+            1.0,
+            "USD".into(),
+            AssetClass::Future,
+        );
+        // Buy limits round down (more conservative)
+        assert_eq!(inst.round_price_side_aware(4500.10, OrderSideForRounding::Buy), 4500.00);
+        // Sell limits round up (more conservative)
+        assert_eq!(inst.round_price_side_aware(4500.10, OrderSideForRounding::Sell), 4500.25);
     }
 
     #[test]
@@ -991,9 +1124,23 @@ mod tests {
             "USD".into(),
             AssetClass::Future,
         );
-        assert!(inst.validate_price(4500.10).is_err());
-        assert!(inst.validate_price(4500.25).is_ok());
-        assert!(inst.validate_price(4500.50).is_ok());
+        assert!(inst.validate_price(4500.10, TickPolicy::Reject).is_err());
+        assert!(inst.validate_price(4500.25, TickPolicy::Reject).is_ok());
+        assert!(inst.validate_price(4500.50, TickPolicy::Reject).is_ok());
+    }
+
+    #[test]
+    fn test_validate_price_with_rounding_policy() {
+        let inst = Instrument::new(
+            "ES".into(),
+            0.25,
+            1.0,
+            "USD".into(),
+            AssetClass::Future,
+        );
+        // RoundNearest policy rounds invalid prices
+        assert_eq!(inst.validate_price(4500.10, TickPolicy::RoundNearest).unwrap(), 4500.00);
+        assert_eq!(inst.validate_price(4500.15, TickPolicy::RoundNearest).unwrap(), 4500.25);
     }
 
     #[test]
@@ -1005,8 +1152,10 @@ mod tests {
             "USD".into(),
             AssetClass::Crypto,
         );
-        assert!(inst.validate_quantity(1.5).is_err());
-        assert!(inst.validate_quantity(1.001).is_ok());
+        assert!(inst.validate_quantity(1.5, TickPolicy::Reject).is_err());
+        assert!(inst.validate_quantity(1.001, TickPolicy::Reject).is_ok());
+        // With rounding policy
+        assert_eq!(inst.validate_quantity(1.5, TickPolicy::RoundNearest).unwrap(), 1.500);
     }
 }
 ```
@@ -1067,15 +1216,21 @@ impl RunId {
     }
 
     /// Generate deterministic run hash
+    /// Uses BLAKE3 for stable, collision-resistant hashing across builds/platforms
     pub fn hash(&self) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use serde_json::json;
 
-        let mut hasher = DefaultHasher::new();
-        self.config_id.0.hash(&mut hasher);
-        self.dataset_hash.0.hash(&mut hasher);
-        self.seed.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        // Canonical serialization (sorted keys)
+        let canonical = json!({
+            "config_id": &self.config_id.0,
+            "dataset_hash": &self.dataset_hash.0,
+            "seed": self.seed,
+        });
+
+        // Use BLAKE3 for stable deterministic hash
+        // Alternative: xxhash64 if BLAKE3 dep is too heavy
+        let hash_bytes = blake3::hash(canonical.to_string().as_bytes());
+        hash_bytes.to_hex().to_string()
     }
 }
 
@@ -1516,8 +1671,20 @@ cargo clippy --package trendlab-core -- -D warnings
 # M2 — Data ingest + canonical cache
 ## Deliverables
 - Ingest CSV/Parquet → validate schema → canonicalize → sort/dedupe → anomaly checks
+- **Multi-symbol time alignment (CRITICAL for correctness)**:
+  - **Problem:** If SPY has a bar but QQQ is missing data, naive loop causes "shift bugs"
+  - **Solution:** Canonical timestamp reindexing
+    1. Extract union of all timestamps across all symbols
+    2. For each symbol, reindex to canonical timestamp set
+    3. Apply **Missing Bar Policy:**
+       - Option A: Forward-fill last valid bar (default for daily data)
+       - Option B: Explicit NaN (strict mode, requires gap handling)
+       - Option C: Reject dataset if gaps exceed threshold
+    4. Validate: all symbols have same bar count and aligned timestamps
+  - **Prevents:** Look-ahead bias from time-shifted data
+  - **BDD Scenario:** See canonicalize.rs tests below
 - Canonical Parquet cache + metadata sidecar (hash, date range, adjustments)
-- Universe sets: local lists + named universes
+- Universe sets: local lists + named universes (using `BTreeSet` for deterministic ordering)
 
 ### File Structure
 
@@ -1724,6 +1891,25 @@ impl Canonicalizer {
         )
     }
 
+    /// Align multi-symbol timestamps to canonical index
+    /// Prevents "shift bugs" where symbols fall out of sync due to data gaps
+    pub fn align_multi_symbol_timestamps(df: LazyFrame) -> LazyFrame {
+        // 1. Extract unique timestamps across ALL symbols
+        // 2. For each symbol, reindex to the canonical timestamp set
+        // 3. Apply forward-fill (or explicit null policy) for missing bars
+        // This ensures bar[i] for all symbols shares the same timestamp
+
+        // Implementation note: Use Polars join_asof or pivot operations
+        // to ensure every symbol has a row for every timestamp in the universe
+        df
+        // TODO: Implement canonical timestamp alignment
+        // Example strategy:
+        // - Get all unique timestamps
+        // - Pivot to wide format (symbol columns)
+        // - Forward-fill nulls (or reject if too many gaps)
+        // - Unpivot back to long format
+    }
+
     /// Detect anomalies (outliers, gaps, suspicious volume)
     pub fn detect_anomalies(df: &DataFrame) -> Vec<AnomalyReport> {
         let mut anomalies = Vec::new();
@@ -1860,33 +2046,44 @@ impl DataCache {
     }
 
     /// Compute deterministic hash of DataFrame content
+    /// Uses BLAKE3 with sampled content to balance correctness vs performance
     fn compute_hash(df: &DataFrame) -> Result<DatasetHash, DataError> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        let mut hasher = blake3::Hasher::new();
 
-        let mut hasher = DefaultHasher::new();
-
-        // Hash column names
-        for name in df.get_column_names() {
-            name.hash(&mut hasher);
+        // Hash schema (column names + types)
+        let schema = df.schema();
+        for field in schema.iter_fields() {
+            hasher.update(field.name().as_bytes());
+            hasher.update(format!("{:?}", field.data_type()).as_bytes());
         }
 
         // Hash row count
-        df.height().hash(&mut hasher);
+        hasher.update(&df.height().to_le_bytes());
 
-        // Hash first/last timestamps and symbols for determinism
-        // (Full content hash would be too expensive; this is a reasonable proxy)
-        if let Ok(ts) = df.column("timestamp") {
-            if let Some(first) = ts.get(0) {
-                format!("{:?}", first).hash(&mut hasher);
-            }
-            if let Some(last) = ts.get(df.height() - 1) {
-                format!("{:?}", last).hash(&mut hasher);
+        // Sampled content hash: every Nth row + per-column checksums
+        // This catches mutations in the middle without full content hash overhead
+        let sample_interval = (df.height() / 100).max(1); // sample ~100 rows
+
+        for (col_idx, col_name) in df.get_column_names().iter().enumerate() {
+            if let Ok(col) = df.column(col_name) {
+                // Hash column name and index
+                hasher.update(col_name.as_bytes());
+                hasher.update(&col_idx.to_le_bytes());
+
+                // Sample rows
+                for row_idx in (0..df.height()).step_by(sample_interval) {
+                    if let Ok(value) = col.get(row_idx) {
+                        hasher.update(format!("{:?}", value).as_bytes());
+                    }
+                }
             }
         }
 
-        let hash_value = format!("{:x}", hasher.finish());
-        Ok(DatasetHash::from_hash(&hash_value))
+        // Include cache schema version for future invalidation
+        hasher.update(b"cache_schema_v1");
+
+        let hash_bytes = hasher.finalize();
+        Ok(DatasetHash::from_hash(&hash_bytes.to_hex()))
     }
 }
 
@@ -1925,13 +2122,14 @@ mod tests {
 
 ```rust
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Universe of symbols
+/// Uses BTreeSet for deterministic iteration order (required for stable hashing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Universe {
     pub name: String,
-    pub symbols: HashSet<String>,
+    pub symbols: BTreeSet<String>,
 }
 
 impl Universe {
@@ -2186,9 +2384,30 @@ cargo run --example ingest_csv -- tests/fixtures/sample.csv
 - [ ] `cargo clippy` has zero warnings
 
 ## BDD
+
 **Feature: Canonical data cache**
+
 - Scenario: ingest produces deterministic dataset hash
 - Scenario: missing days remain missing (no silent forward fill)
+
+**Feature: Multi-symbol time alignment**
+
+```gherkin
+Scenario: Multi-symbol alignment prevents shift bugs
+  Given SPY has bars at timestamps [T0, T1, T2, T3]
+  And QQQ has bars at timestamps [T0, T1, T3] (missing T2)
+  When data is canonicalized with forward-fill policy
+  Then QQQ is reindexed to [T0, T1, T2, T3]
+  And QQQ bar at T2 is forward-filled from T1
+  And all symbols have identical timestamp index
+  And bar[i] for SPY and bar[i] for QQQ share the same timestamp
+
+Scenario: Strict mode rejects excessive gaps
+  Given a dataset with symbol AAPL missing 20% of bars
+  And missing bar policy is "reject if gaps > 10%"
+  When data is canonicalized
+  Then an error is raised: "ExcessiveGaps: AAPL missing 20% of bars"
+```
 
 ---
 
@@ -2208,6 +2427,8 @@ cargo run --example ingest_csv -- tests/fixtures/sample.csv
 - **Warmup** handling:
   - no orders before required history exists
   - warmup length defined per feature set / strategy
+  - **warmup must sync with feature cache** (M8): if user changes 20-day MA to 200-day MA, warmup auto-updates
+  - expose `max_lookback()` method on all indicators/features to compute required warmup
 - Accounting:
   - equity, realized/unrealized PnL, fees
 
@@ -2259,6 +2480,16 @@ impl WarmupState {
         }
     }
 
+    /// Compute warmup from feature requirements (max lookback across all indicators)
+    pub fn from_features(features: &[impl Indicator]) -> Self {
+        let max_lookback = features
+            .iter()
+            .map(|f| f.max_lookback())
+            .max()
+            .unwrap_or(0);
+        Self::new(max_lookback)
+    }
+
     pub fn process_bar(&mut self) {
         self.bars_processed += 1;
     }
@@ -2274,6 +2505,11 @@ impl WarmupState {
             self.warmup_bars - self.bars_processed
         }
     }
+}
+
+/// Trait for indicators to expose their lookback requirements
+pub trait Indicator {
+    fn max_lookback(&self) -> usize;
 }
 
 #[cfg(test)]
@@ -2783,6 +3019,9 @@ Cancel/Replace must be **atomic** because PM depends on it.
 - **CancelReplace atomic operation**
   - partial fill rules: amend only remaining qty
   - audit trail for trade tape
+  - **timing rule**: cancel/replace is applied at **Post-Bar boundary** (after PM emits intents for next bar)
+  - NOT allowed mid-Intrabar (avoids ambiguity with remaining price path)
+  - ensures no "stopless window" between cancel and replacement
 
 ## Enhanced M4 Specification
 
@@ -2800,6 +3039,67 @@ trendlab-core/src/
 │   └── cancel_replace.rs   # Atomic cancel/replace operation
 └── tests/
     └── bdd_orders.rs       # Cucumber BDD tests
+```
+
+### Intrabar Micro-Timeline (Canonical Execution Order)
+
+This defines the exact sub-step ordering within a single bar to eliminate ambiguity.
+
+**Sub-Steps (executed in order):**
+
+1. **Open Fill Step:**
+   - MOO orders fill at open
+   - Gap-through stops fill at open (worse price)
+
+2. **Activation Step:**
+   - Bracket children become active IF parent filled
+   - Stops/limits transition from Pending → Active
+
+3. **Path Traversal Steps:** (WorstCase/Deterministic/MC policy applies here)
+   - Evaluate all active triggers in adversarial order (WorstCase default)
+   - Process fills, update portfolio
+
+4. **Close Fill Step:**
+   - MOC orders fill at close
+   - Remaining unfilled orders persist (or expire per TIF)
+
+**Key Invariants:**
+
+- Bracket children can fill **in the same bar** as parent (after Activation Step)
+- WorstCase priority: if both stop and target reachable → fill stop first (worse outcome)
+- No trigger evaluation happens before Activation Step (prevents look-ahead)
+
+**BDD Scenarios:**
+
+```gherkin
+Feature: Intrabar execution semantics
+
+  Scenario: Entry fills at open; stop touched later in same bar
+    Given a bracket order enters at bar open (110.0)
+    And the stop is set at 105.0
+    And the bar has open=110.0, low=104.0, high=115.0, close=112.0
+    When the bar is processed
+    Then the entry fills at open (110.0)
+    And the stop becomes active in Activation Step
+    And the stop fills at 105.0 in Path Traversal
+    And the position is closed
+
+  Scenario: Stop and target both reachable same bar; WorstCase chooses worse
+    Given a long position at 100.0
+    And a bracket with stop=95.0, target=105.0
+    And a bar with open=100.0, low=94.0, high=106.0, close=102.0
+    When WorstCase mode is enabled
+    Then the stop fills first at 95.0 (worse outcome)
+    And the target is never evaluated (OCO sibling cancelled)
+
+  Scenario: Bracket child remains Pending until parent fills
+    Given a bracket order with parent not yet filled
+    And the stop price is 105.0
+    When a bar touches 105.0 before parent fills
+    Then the stop does NOT fill
+    And the stop remains in Pending state
+    When the parent fills
+    Then the stop transitions to Active state
 ```
 
 ### Complete Implementations
@@ -4201,9 +4501,22 @@ Result:
   - Fixed (bps or absolute)
   - ATR-based (multiple of ATR)
 - Execution presets: Optimistic, Realistic, Hostile
+- **Intrabar order activation semantics**:
+  - If entry fills mid-bar, bracket children activate **immediately** within remaining price path
+  - Treat Intrabar as micro-event queue with segments: trigger → fill → activate children → continue path
+  - Maintains bar-level simulation without requiring tick data
+- **SpreadModel separate from SlippageModel**:
+  - Market orders: cross spread + pay slippage
+  - Limit orders (passive fills): earn half-spread, but model adverse selection as small negative edge
+  - Optional: partial fill probability / queue depth simulation
 - **Liquidity constraint (optional)**:
   - Participation limit (% of bar volume)
+  - **Competing orders rule**: If multiple orders on same symbol want fills, allocate by:
+    - Priority order (then subtract remaining volume), OR
+    - Pro-rata by requested qty, OR
+    - Time priority (order age)
   - Remainder policy: Carry, Cancel, PartialFill
+  - **Slippage-to-volume scaling**: as order consumes larger % of bar volume, slippage increases non-linearly
 
 ## File Structure
 
@@ -4235,6 +4548,82 @@ pub use slippage::{SlippageModel, FixedSlippage, AtrSlippage};
 pub use priority::{PriorityPolicy, WorstCasePriority, BestCasePriority, PriceOrderPriority};
 pub use preset::{ExecutionPreset, Optimistic, Realistic, Hostile};
 pub use liquidity::{LiquidityConstraint, RemainderPolicy};
+```
+
+### Liquidity Allocation Rule (Canonical)
+
+When multiple orders compete for limited bar volume, we use **Time-Priority (FIFO)** allocation.
+
+**Rationale:** Time-priority is simple, realistic (matches most exchange behavior), and deterministic given stable order submission sequence.
+
+**Algorithm:**
+
+```text
+Given:
+- Bar volume: V_bar
+- Max participation: P_pct → max_fill_volume = V_bar × P_pct
+- Orders: [O1(qty=q1, time=t1), O2(qty=q2, time=t2), O3(qty=q3, time=t3)]
+  (sorted by submission timestamp: t1 < t2 < t3)
+
+Allocation (FIFO):
+1. remaining_volume = max_fill_volume
+2. For each order Oi in time-order:
+   a. fill_qty = min(qi, remaining_volume)
+   b. Fill Oi with fill_qty
+   c. remaining_volume -= fill_qty
+   d. If remaining_volume == 0, stop (all later orders unfilled)
+3. Unfilled remainder:
+   - Orders with partial fills: remaining qty stays Active (or expires per TIF)
+   - Unfilled orders: remain Active (or expire per TIF)
+```
+
+**Example:**
+
+```text
+Bar volume: 10,000 shares
+Max participation: 10% → max_fill_volume = 1,000 shares
+
+Orders (sorted by time):
+- Order A: 800 shares @ T+0
+- Order B: 500 shares @ T+1
+- Order C: 400 shares @ T+2
+
+Allocation:
+1. Order A: fill 800 shares (remaining: 1,000 - 800 = 200)
+2. Order B: fill 200 shares (partial, remaining: 0)
+3. Order C: no fill (pool exhausted)
+
+Result:
+- Order A: Filled (800/800)
+- Order B: Partial (200/500, 300 remaining Active)
+- Order C: Unfilled (400 remaining Active)
+```
+
+**BDD Scenario:**
+
+```gherkin
+Feature: Liquidity constraint with time-priority allocation
+
+  Scenario: Multiple orders compete for limited volume
+    Given bar volume is 10,000 shares
+    And max_participation is 10%
+    And Order A is submitted at T+0 for 800 shares
+    And Order B is submitted at T+1 for 500 shares
+    And Order C is submitted at T+2 for 400 shares
+    When the bar is processed
+    Then Order A fills 800 shares (complete)
+    And Order B fills 200 shares (partial)
+    And Order C fills 0 shares (no fill)
+    And Order B has 300 shares remaining in Active state
+    And Order C has 400 shares remaining in Active state
+
+  Scenario: Sufficient volume fills all orders
+    Given bar volume is 10,000 shares
+    And max_participation is 20%
+    And three orders totaling 1,500 shares
+    When the bar is processed
+    Then all orders fill completely
+    And 500 shares of capacity remain unused
 ```
 
 ### execution/fill_engine.rs
@@ -4985,7 +5374,28 @@ use crate::orders::OrderType;
 
 /// SlippageModel: computes slippage to add to fill price
 pub trait SlippageModel: Send + Sync {
-    fn compute_slippage(&self, base_price: f64, order_type: &OrderType, was_gapped: bool) -> f64;
+    fn compute_slippage(
+        &self,
+        base_price: f64,
+        order_type: &OrderType,
+        was_gapped: bool,
+        fill_qty: u32,
+        bar_volume: f64,
+    ) -> f64;
+}
+
+/// SpreadModel: computes bid-ask spread costs
+/// Separate from slippage to model market-making costs accurately
+pub trait SpreadModel: Send + Sync {
+    /// Compute spread cost
+    /// Returns negative for passive limit fills (earn half-spread),
+    /// positive for aggressive market fills (pay spread)
+    fn compute_spread_cost(
+        &self,
+        base_price: f64,
+        order_type: &OrderType,
+        is_passive: bool,
+    ) -> f64;
 }
 
 /// FixedSlippage: constant slippage in dollars
@@ -5005,23 +5415,42 @@ impl FixedSlippage {
 }
 
 impl SlippageModel for FixedSlippage {
-    fn compute_slippage(&self, base_price: f64, order_type: &OrderType, was_gapped: bool) -> f64 {
+    fn compute_slippage(
+        &self,
+        base_price: f64,
+        order_type: &OrderType,
+        was_gapped: bool,
+        fill_qty: u32,
+        bar_volume: f64,
+    ) -> f64 {
+        let mut base_slippage = self.slippage;
+
+        // Volume-based scaling: as order consumes more of bar volume, slippage increases
+        let participation_rate = (fill_qty as f64 * base_price) / (bar_volume * base_price);
+        let volume_multiplier = if participation_rate > 0.01 {
+            // Non-linear scaling: 1.0 + (participation_rate * 10)^1.5
+            1.0 + (participation_rate * 10.0).powf(1.5)
+        } else {
+            1.0
+        };
+        base_slippage *= volume_multiplier;
+
         // For gapped stops, additional adverse slippage
         if was_gapped {
-            return self.slippage * 2.0;
+            base_slippage *= 2.0;
         }
 
         // Direction-aware slippage
         match order_type {
-            OrderType::Market(_) => self.slippage,
+            OrderType::Market(_) => base_slippage,
             OrderType::StopMarket { direction, .. } => {
                 use crate::orders::order_type::StopDirection;
                 match direction {
-                    StopDirection::Buy => self.slippage,  // Pay slippage on buys
-                    StopDirection::Sell => -self.slippage, // Receive worse on sells
+                    StopDirection::Buy => base_slippage,  // Pay slippage on buys
+                    StopDirection::Sell => -base_slippage, // Receive worse on sells
                 }
             }
-            OrderType::Limit { .. } => 0.0, // Limits don't slip (you get limit price)
+            OrderType::Limit { .. } => 0.0, // Limits handled by SpreadModel
             OrderType::StopLimit { .. } => 0.0,
         }
     }
@@ -5040,11 +5469,27 @@ impl AtrSlippage {
 }
 
 impl SlippageModel for AtrSlippage {
-    fn compute_slippage(&self, base_price: f64, order_type: &OrderType, was_gapped: bool) -> f64 {
-        let base_slippage = self.atr * self.atr_multiple;
+    fn compute_slippage(
+        &self,
+        base_price: f64,
+        order_type: &OrderType,
+        was_gapped: bool,
+        fill_qty: u32,
+        bar_volume: f64,
+    ) -> f64 {
+        let mut base_slippage = self.atr * self.atr_multiple;
+
+        // Volume-based scaling (same as FixedSlippage)
+        let participation_rate = (fill_qty as f64 * base_price) / (bar_volume * base_price);
+        let volume_multiplier = if participation_rate > 0.01 {
+            1.0 + (participation_rate * 10.0).powf(1.5)
+        } else {
+            1.0
+        };
+        base_slippage *= volume_multiplier;
 
         if was_gapped {
-            return base_slippage * 2.0;
+            base_slippage *= 2.0;
         }
 
         match order_type {
@@ -5056,7 +5501,7 @@ impl SlippageModel for AtrSlippage {
                     StopDirection::Sell => -base_slippage,
                 }
             }
-            OrderType::Limit { .. } => 0.0,
+            OrderType::Limit { .. } => 0.0, // Handled by SpreadModel
             OrderType::StopLimit { .. } => 0.0,
         }
     }
@@ -5890,8 +6335,11 @@ Summary:
 ---
 
 # M6 — Position management (anti-stickiness) + ratchet invariant
+
+**Full Specification:** [M6-position-management-specification.md](M6-position-management-specification.md) (1,673 lines)
+
 ## Critique-driven additions
-- Explicit regression scenarios for stickiness and “volatility trap.”
+- Explicit regression scenarios for stickiness and "volatility trap."
 - Stops must obey a **ratchet** invariant under volatility expansion.
 
 ## Deliverables
@@ -5902,7 +6350,162 @@ Summary:
   - stop may tighten, never loosen (even if ATR expands)
 - Anti-stickiness scenarios:
   - chandelier-style exit not trapped by chasing highs
-  - floor-style tightening that doesn’t chase ceiling
+  - floor-style tightening that doesn't chase ceiling
+
+### Quick Reference Card
+
+**Core Files (8 files, ~950 lines):**
+```
+trendlab-core/src/position_management/
+├── mod.rs                    # Module root + exports
+├── manager.rs                # PositionManager trait + PmRegistry
+├── intent.rs                 # OrderIntent, CancelReplaceIntent
+├── ratchet.rs                # RatchetState, ratchet enforcement
+└── strategies/
+    ├── mod.rs                # Strategy module exports
+    ├── fixed_percent.rs      # Fixed % stop loss
+    ├── atr_stop.rs           # ATR-based stop (with ratchet)
+    ├── chandelier.rs         # Chandelier exit (anti-stickiness)
+    └── time_stop.rs          # Time-based exit
+```
+
+**Key Traits/Structs:**
+```rust
+// Core trait - all PM strategies implement this
+pub trait PositionManager {
+    fn update(&self, position: &Position, bar: &Bar) -> Vec<OrderIntent>;
+    fn name(&self) -> &str;
+}
+
+// Ratchet prevents stops from loosening
+pub struct RatchetState {
+    current_level: Decimal,
+    side: Side,
+    enabled: bool,
+}
+
+impl RatchetState {
+    /// Apply ratchet: proposed can only tighten, never loosen
+    pub fn apply(&mut self, proposed: Decimal) -> Decimal {
+        match self.side {
+            Side::Long => self.current_level.max(proposed),  // stop rises
+            Side::Short => self.current_level.min(proposed), // stop falls
+        }
+    }
+}
+
+// Anti-stickiness: Chandelier exit
+pub struct ChandelierExit {
+    lookback: usize,        // e.g., 20 bars
+    atr_mult: f64,          // e.g., 2.0
+    reference_high: Decimal, // Snapshot, doesn't chase
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Ratchet invariant prevents volatility trap
+
+  Scenario: Ratchet prevents loosening on volatility spike
+    Given long position entered at $100 with stop at $95
+    And initial ATR of $5 (2x ATR stop = $95)
+    When price rises to $110
+    And ATR expands to $10 (market volatility increases)
+    Then proposed stop is $90 (110 - 2*10)
+    But ratchet blocks it (can't loosen from $95)
+    And stop remains at $95
+
+  Scenario: Ratchet allows tightening on favorable move
+    Given long position with stop at $95
+    When price rises to $110 and ATR is stable at $5
+    Then proposed stop is $100 (110 - 2*5)
+    And ratchet allows it (tightening from $95 to $100)
+    And stop updates to $100
+
+Feature: Anti-stickiness via snapshot reference levels
+
+  Scenario: Chandelier exit allows exit in rise-then-fall
+    Given long position entered at $100
+    And ChandelierExit(lookback=20, atr_mult=2.0)
+    When price rises to $120 (new 20-bar high)
+    Then reference_high captures $120 as snapshot
+    And stop is placed at ($120 - 2*ATR) = ~$115
+    When price subsequently falls to $116
+    Then stop does NOT chase (reference_high stays $120)
+    And position exits at $115 stop (profitable exit)
+    And NOT stuck waiting for new high
+
+  Scenario: Floor tightening tightens on rises but not falls
+    Given long position with ATR floor stop
+    When price makes new high at $130
+    Then floor updates to new level
+    And stop tightens accordingly
+    When price falls back to $120
+    Then floor does NOT update (no chasing down)
+    And stop remains at previous tightened level
+```
+
+**Verification Commands:**
+```bash
+# Create module structure
+mkdir -p trendlab-core/src/position_management/strategies
+touch trendlab-core/src/position_management/{mod.rs,manager.rs,intent.rs,ratchet.rs}
+touch trendlab-core/src/position_management/strategies/{mod.rs,fixed_percent.rs,atr_stop.rs,chandelier.rs,time_stop.rs}
+
+# Run BDD tests
+cargo test --test bdd_position_management_ratchet
+cargo test --test bdd_position_management_anti_stickiness
+
+# Expected output:
+# Feature: Ratchet invariant prevents volatility trap
+#   Scenario: Ratchet prevents loosening on volatility spike ... ok
+#   Scenario: Ratchet allows tightening on favorable move ... ok
+# Feature: Anti-stickiness via snapshot reference levels
+#   Scenario: Chandelier exit allows exit in rise-then-fall ... ok
+#   Scenario: Floor tightening tightens on rises but not falls ... ok
+#
+# 4 scenarios (4 passed)
+
+# Run unit tests
+cargo test -p trendlab-core position_management::
+
+# Integration test: Full chandelier path
+cargo test -p trendlab-core test_chandelier_exit_full_path -- --nocapture
+
+# Expected: Position exits profitably at $115, not stuck chasing highs
+```
+
+**Example Flow: Ratchet Prevents Volatility Trap**
+```text
+1. Position State:
+   Position { entry: $100, qty: 100, stop: $95 }
+
+2. Market moves up:
+   Bar { close: $110, ATR: $5 → $10 (volatility spike) }
+
+3. ATR Stop Strategy proposes update:
+   proposed_stop = $110 - (2.0 * $10) = $90
+
+4. Ratchet enforcement:
+   RatchetState.apply($90)
+   → max($95, $90) = $95 (blocks loosening)
+
+5. OrderIntent emitted:
+   OrderIntent::None (no change needed, stop stays $95)
+
+6. Result:
+   ✓ Stop protected at $95 despite ATR expansion
+   ✗ Without ratchet: stop would loosen to $90, risking larger loss
+```
+
+**Completion Criteria:**
+- [ ] All 8 PM module files exist with full implementations
+- [ ] PositionManager trait implemented by 4 strategies
+- [ ] RatchetState enforces invariant in all ATR-based strategies
+- [ ] ChandelierExit uses snapshot reference levels (not chasing)
+- [ ] BDD tests pass for ratchet and anti-stickiness scenarios
+- [ ] Property test: stops never loosen across 1000 random price paths
+- [ ] Integration test: chandelier allows profitable exit in rise-then-fall
 
 ## BDD
 **Feature: Ratchet invariant**
@@ -5912,11 +6515,16 @@ Summary:
 - Scenario: chandelier exit allows profitable exit in a rise-then-fall path
 - Scenario: floor tightening tightens on rises but not on falls
 
+**Full scenarios and implementation:** [M6-position-management-specification.md](M6-position-management-specification.md)
+
 ---
 
 # M7 — Strategy composition + normalization for fair comparisons
+
+**Full Specification:** [M7-composition-normalization-specification.md](M7-composition-normalization-specification.md) (1,366 lines)
+
 ## Critique-driven addition
-Make “same PM across signals” testable here, not later.
+Make "same PM across signals" testable here, not later.
 
 ## Deliverables
 - Signals are portfolio-agnostic (exposure/intent)
@@ -5924,19 +6532,223 @@ Make “same PM across signals” testable here, not later.
 - Sizers: fixed qty/notional + ATR-risk sizing (MVP)
 - Compose: (Signal + OrderPolicy + PM + ExecutionPreset + Sizer)
 
+### Quick Reference Card
+
+**Core Files (10 files, ~1,100 lines):**
+```text
+trendlab-core/src/
+├── signals/
+│   ├── mod.rs              # Signal trait + SignalIntent
+│   ├── intent.rs           # Intent enum (Long/Short/Flat)
+│   └── examples/
+│       ├── ma_cross.rs     # Moving average crossover
+│       └── donchian.rs     # Donchian breakout
+├── order_policy/
+│   ├── mod.rs              # OrderPolicy trait
+│   ├── natural.rs          # Natural policy (breakout→stop, mean-reversion→limit)
+│   └── immediate.rs        # Immediate MOO/MOC policy
+├── sizers/
+│   ├── mod.rs              # Sizer trait
+│   ├── fixed.rs            # Fixed quantity/notional
+│   └── atr_risk.rs         # ATR-based risk sizing
+└── composer/
+    ├── mod.rs              # StrategyComposer
+    └── manifest.rs         # StrategyManifest (immutable config)
+```
+
+**Key Traits/Structs:**
+```rust
+// Signals are portfolio-agnostic
+pub trait Signal {
+    /// Generate intent based ONLY on market data, never portfolio state
+    fn generate(&self, bars: &[Bar]) -> SignalIntent;
+    fn name(&self) -> &str;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalIntent {
+    Long,      // Want long exposure
+    Short,     // Want short exposure
+    Flat,      // Want no exposure
+}
+
+// OrderPolicy translates intent → order type
+pub trait OrderPolicy {
+    fn translate(
+        &self,
+        intent: SignalIntent,
+        current_position: Option<&Position>,
+        bar: &Bar,
+    ) -> Vec<Order>;
+}
+
+// Natural policy: breakouts use stop entries, mean-reversion uses limits
+pub struct NaturalOrderPolicy {
+    signal_family: SignalFamily,  // Breakout, MeanReversion, Trend
+}
+
+// Sizer determines quantity
+pub trait Sizer {
+    fn size(&self, equity: Decimal, signal: SignalIntent, bar: &Bar) -> Decimal;
+}
+
+// Composer assembles all pieces
+pub struct StrategyComposer {
+    signal: Box<dyn Signal>,
+    order_policy: Box<dyn OrderPolicy>,
+    pm: Box<dyn PositionManager>,
+    sizer: Box<dyn Sizer>,
+    execution_preset: ExecutionPreset,
+}
+
+// Manifest = immutable configuration for reproducibility
+#[derive(Serialize, Deserialize)]
+pub struct StrategyManifest {
+    pub signal_name: String,
+    pub signal_params: HashMap<String, Value>,
+    pub order_policy: String,
+    pub pm_name: String,
+    pub pm_params: HashMap<String, Value>,
+    pub sizer: String,
+    pub execution_preset: String,
+    pub config_hash: String,  // Deterministic hash for caching
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Signals are portfolio-agnostic
+
+  Scenario: Signal ignores current position
+    Given a DonchianBreakout(20) signal
+    And current portfolio has no position in SPY
+    When price breaks above 20-day high
+    Then signal emits SignalIntent::Long
+
+    Given the same signal
+    And current portfolio already has long position in SPY
+    When price breaks above 20-day high again
+    Then signal STILL emits SignalIntent::Long (unchanged)
+    And signal does NOT check portfolio state
+
+Feature: Natural OrderPolicy matches signal family
+
+  Scenario: Breakout signal uses stop entries (not MOO)
+    Given a DonchianBreakout signal (breakout family)
+    And NaturalOrderPolicy
+    When signal emits SignalIntent::Long at bar close $100
+    And 20-day high is $105
+    Then OrderPolicy emits StopMarket order at $105.01
+    And NOT a MarketOnOpen order
+
+  Scenario: Mean-reversion signal uses limit entries
+    Given a BollingerMeanReversion signal
+    And NaturalOrderPolicy
+    When signal emits SignalIntent::Long (price at lower band)
+    Then OrderPolicy emits Limit order at favorable price
+    And NOT a market order
+
+Feature: Fair comparison via PM normalization
+
+  Scenario: Multiple signals with identical PM isolate signal quality
+    Given Signal A: MA(20) crossover
+    And Signal B: Donchian(20) breakout
+    And both use FixedPercentStop(2%)
+    And both use AtrRiskSizer(1% risk per trade)
+    And both use same ExecutionPreset (WorstCase)
+    When both run on same dataset
+    Then performance differences reflect ONLY signal timing
+    And NOT differences in PM or execution assumptions
+```
+
+**Verification Commands:**
+```bash
+# Create module structure
+mkdir -p trendlab-core/src/{signals/examples,order_policy,sizers,composer}
+
+# Run BDD tests
+cargo test --test bdd_signals_portfolio_agnostic
+cargo test --test bdd_order_policy_natural
+cargo test --test bdd_fair_comparison_normalization
+
+# Expected output:
+# Feature: Signals are portfolio-agnostic
+#   Scenario: Signal ignores current position ... ok
+# Feature: Natural OrderPolicy matches signal family
+#   Scenario: Breakout signal uses stop entries ... ok
+#   Scenario: Mean-reversion signal uses limit entries ... ok
+# Feature: Fair comparison via PM normalization
+#   Scenario: Multiple signals with identical PM ... ok
+#
+# 4 scenarios (4 passed)
+
+# Run unit tests
+cargo test -p trendlab-core signals::
+cargo test -p trendlab-core composer::
+
+# Integration test: Full composition pipeline
+cargo test -p trendlab-core test_strategy_composition_end_to_end -- --nocapture
+```
+
+**Example Flow: Signal → OrderPolicy → Sizer → Order**
+```text
+1. Signal Generation (portfolio-agnostic):
+   DonchianBreakout.generate(bars)
+   → price $107 breaks above 20-day high $105
+   → SignalIntent::Long
+
+2. OrderPolicy Translation:
+   NaturalOrderPolicy.translate(Long, None, bar)
+   → breakout family → use stop entry
+   → StopMarket { stop_price: $105.01 }
+
+3. Sizer Determines Quantity:
+   AtrRiskSizer.size(equity: $10000, intent: Long, bar)
+   → risk 1% of equity = $100
+   → ATR = $2
+   → qty = $100 / $2 = 50 shares
+
+4. Order Emission:
+   Order {
+     type: StopMarket { stop: $105.01 },
+     side: Buy,
+     qty: 50,
+   }
+
+5. Result:
+   ✓ Signal never touched portfolio state
+   ✓ OrderPolicy matched natural entry style (stop for breakout)
+   ✓ Sizer normalized risk across different signals
+```
+
+**Completion Criteria:**
+- [ ] Signal trait implemented with portfolio-agnostic contract
+- [ ] 2+ example signals (MA cross, Donchian breakout)
+- [ ] NaturalOrderPolicy maps signal families to order types
+- [ ] 2+ sizers (Fixed, AtrRisk)
+- [ ] StrategyComposer assembles all components
+- [ ] StrategyManifest generates deterministic config hash
+- [ ] BDD tests pass for portfolio-agnostic signals
+- [ ] Integration test: compose and run full strategy
+
 ## BDD
 **Feature: Signals ignore portfolio**
 - Scenario: signal emits same intent regardless of current position
 
 **Feature: Breakout uses stop entries**
-- Scenario: Donchian breakout issues stop entry above level (not “buy next open”)
+- Scenario: Donchian breakout issues stop entry above level (not "buy next open")
 
 **Feature: Fair signal comparison via PM normalization**
 - Scenario: multiple signals share identical PM and execution; differences reflect signal timing
 
+**Full scenarios and implementation:** [M7-composition-normalization-specification.md](M7-composition-normalization-specification.md)
+
 ---
 
 # M8 — Runner (sweeps) + caching + cache invalidation + leaderboards
+
+**Full Specification:** [M8-walkforward-oos-specification.md](M8-walkforward-oos-specification.md) (1,697 lines)
+
 ## Critique-driven addition
 Caching must have explicit invalidation rules.
 
@@ -5951,6 +6763,300 @@ Caching must have explicit invalidation rules.
   - feature cache keyed by dataset hash + feature spec id
   - indicator cache invalidated by param changes
   - result cache keyed by manifest hash (auto invalidation)
+- **Feature-to-Warmup automatic sync**
+  - All indicators implement `max_lookback()` method
+  - Runner detects when config changes increase lookback (e.g., MA(20) → MA(200))
+  - Automatically invalidate cache and increase warmup period
+  - Prevents calculating signals on insufficient/null data
+  - **Code example:** See warmup validation below
+
+### Quick Reference Card
+
+**Core Files (12 files, ~1,400 lines):**
+```text
+trendlab-runner/src/
+├── mod.rs
+├── sweep/
+│   ├── mod.rs              # Sweep orchestrator
+│   ├── structural.rs       # Structural exploration (signals × PMs × execution)
+│   └── parameter.rs        # Parameter sampling (grid/random/smart)
+├── cache/
+│   ├── mod.rs              # Cache manager
+│   ├── features.rs         # Feature cache (dataset_hash + spec_id)
+│   ├── indicators.rs       # Indicator cache (params → values)
+│   ├── results.rs          # Result cache (manifest_hash → output)
+│   └── invalidation.rs     # Cache invalidation logic
+├── leaderboard/
+│   ├── mod.rs              # Leaderboard manager
+│   ├── session.rs          # Session leaderboard (current run)
+│   ├── all_time.rs         # All-time leaderboard (persistent)
+│   └── categories.rs       # Signal-only, PM, execution, composite
+└── persistence/
+    ├── mod.rs              # Artifact writer
+    ├── manifest.rs         # Manifest serialization
+    └── diagnostics.rs      # Diagnostics capture
+```
+
+**Key Traits/Structs:**
+```rust
+// Sweep orchestrator
+pub struct SweepRunner {
+    cache_manager: CacheManager,
+    leaderboard: LeaderboardManager,
+    persistence: PersistenceLayer,
+}
+
+impl SweepRunner {
+    /// Run full-auto sweep (structural + parameter exploration)
+    pub async fn run_sweep(&mut self, config: SweepConfig) -> SweepResults {
+        // 1. Structural: all combinations of (signal × PM × execution)
+        // 2. Parameter: sample param space for promising candidates
+        // 3. Cache: reuse results where manifest hash matches
+        // 4. Leaderboard: rank by category
+    }
+}
+
+// Cache invalidation rules
+pub struct CacheManager {
+    features: FeatureCache,    // dataset_hash + spec_id
+    indicators: IndicatorCache, // params → values
+    results: ResultCache,       // manifest_hash → output
+}
+
+impl CacheManager {
+    /// Check if cached result is valid
+    pub fn get_or_compute<F>(&self, manifest: &StrategyManifest, compute: F) -> RunResult
+    where
+        F: FnOnce() -> RunResult,
+    {
+        let key = manifest.hash();
+        if let Some(cached) = self.results.get(&key) {
+            if self.is_valid(&cached) {
+                return cached;
+            }
+        }
+        compute()
+    }
+
+    /// Invalidation logic
+    fn is_valid(&self, cached: &RunResult) -> bool {
+        // Invalidate if:
+        // - dataset changed (hash mismatch)
+        // - signal params changed
+        // - PM params changed
+        // - execution preset changed
+    }
+}
+
+// Leaderboard with multiple categories
+pub struct LeaderboardManager {
+    signal_only: Leaderboard,    // Same PM/exec, compare signals
+    pm_only: Leaderboard,         // Same signal/exec, compare PMs
+    execution: Leaderboard,       // Same signal/PM, compare execution
+    composite: Leaderboard,       // All factors vary
+}
+
+// Reproducibility via manifest
+#[derive(Serialize, Deserialize)]
+pub struct RunManifest {
+    pub strategy: StrategyManifest,
+    pub dataset_hash: DatasetHash,
+    pub seed: u64,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl RunManifest {
+    /// Deterministic hash for caching
+    pub fn hash(&self) -> String {
+        // Hash all config fields
+    }
+
+    /// Reproduce exact run from manifest
+    pub fn reproduce(&self) -> RunResult {
+        // Load cached or recompute
+    }
+}
+```
+
+**Feature-Warmup Sync (Code Example):**
+
+```rust
+/// Trait for indicators to declare their lookback requirements
+pub trait Indicator {
+    fn max_lookback(&self) -> usize;
+}
+
+/// Example: Moving Average indicator
+pub struct MovingAverage {
+    period: usize,
+}
+
+impl Indicator for MovingAverage {
+    fn max_lookback(&self) -> usize {
+        self.period  // MA(200) needs 200 bars of history
+    }
+}
+
+/// Runner validates warmup against feature requirements
+impl SweepRunner {
+    pub fn validate_warmup(&self, config: &StrategyConfig) -> Result<(), WarmupError> {
+        let required = config.indicators.iter()
+            .map(|i| i.max_lookback())
+            .max()
+            .unwrap_or(0);
+
+        if self.warmup_bars < required {
+            return Err(WarmupError::InsufficientWarmup {
+                required,
+                provided: self.warmup_bars,
+            });
+        }
+        Ok(())
+    }
+
+    /// Auto-invalidate cache when warmup requirement increases
+    pub fn detect_warmup_change(&mut self, old_config: &StrategyConfig, new_config: &StrategyConfig) {
+        let old_req = old_config.indicators.iter().map(|i| i.max_lookback()).max().unwrap_or(0);
+        let new_req = new_config.indicators.iter().map(|i| i.max_lookback()).max().unwrap_or(0);
+
+        if new_req > old_req {
+            // Invalidate feature cache - warmup requirement increased
+            self.cache_manager.invalidate_features();
+            self.warmup_bars = new_req;
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WarmupError {
+    #[error("Insufficient warmup: required {required} bars, provided {provided}")]
+    InsufficientWarmup { required: usize, provided: usize },
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Cache invalidation correctness
+
+  Scenario: Parameter change invalidates indicator cache
+    Given MA(20) cached for SPY dataset
+    When user changes param to MA(50)
+    Then indicator cache is invalidated
+    And MA(50) is recomputed from scratch
+
+  Scenario: Identical config uses cache (no recompute)
+    Given a backtest run with manifest_hash "abc123"
+    And result cached: equity=$10,500, trades=15
+    When user reruns EXACT same manifest
+    Then cached result is returned
+    And NO recomputation happens
+    And result matches: equity=$10,500, trades=15
+
+  Scenario: Dataset change invalidates all caches
+    Given results cached for SPY (dataset_hash "def456")
+    When user loads new SPY data (dataset_hash "xyz789")
+    Then ALL cached results are invalidated
+    And fresh computation required
+
+Feature: Leaderboard reproducibility
+
+  Scenario: Leaderboard row reruns identically from manifest
+    Given leaderboard row #1:
+      | manifest_hash | sharpe | equity | trades |
+      | abc123        | 2.5    | 12000  | 20     |
+    When user clicks "Reproduce Run"
+    And system loads manifest "abc123"
+    And reruns backtest
+    Then results match exactly:
+      | sharpe | equity | trades |
+      | 2.5    | 12000  | 20     |
+
+Feature: Multi-category leaderboards
+
+  Scenario: Signal-only leaderboard isolates signal quality
+    Given 5 signals: [MA_cross, Donchian, RSI, Bollinger, MACD]
+    And all use SAME PM (ATR stop 2%)
+    And all use SAME execution (WorstCase)
+    When sweep completes
+    Then signal-only leaderboard ranks by signal quality ONLY
+    And differences reflect signal timing, not PM/exec
+```
+
+**Verification Commands:**
+```bash
+# Create runner workspace
+cargo new --lib trendlab-runner
+
+# Run BDD tests
+cargo test --package trendlab-runner --test bdd_cache_invalidation
+cargo test --package trendlab-runner --test bdd_leaderboard_reproducibility
+
+# Expected output:
+# Feature: Cache invalidation correctness
+#   Scenario: Parameter change invalidates indicator cache ... ok
+#   Scenario: Identical config uses cache ... ok
+#   Scenario: Dataset change invalidates all caches ... ok
+# Feature: Leaderboard reproducibility
+#   Scenario: Leaderboard row reruns identically ... ok
+#
+# 4 scenarios (4 passed)
+
+# Run full sweep (integration test)
+cargo run --package trendlab-runner --bin sweep -- \
+  --dataset data/spy_daily.parquet \
+  --signals ma_cross,donchian \
+  --pms atr_stop,chandelier \
+  --execution worst_case,deterministic
+
+# Expected: Leaderboards generated, manifests persisted, cache hit rate reported
+```
+
+**Example Flow: Sweep with Caching**
+```text
+1. Sweep Config:
+   - Signals: [MA_cross(10,20), MA_cross(20,50), Donchian(20)]
+   - PMs: [ATR_stop(2%), Chandelier(20,2)]
+   - Execution: [WorstCase, Deterministic]
+   - Combinations: 3 × 2 × 2 = 12 runs
+
+2. Run 1: MA_cross(10,20) + ATR_stop(2%) + WorstCase
+   manifest_hash = "abc123"
+   → Cache MISS (first run)
+   → Compute → Store result
+
+3. Run 2: MA_cross(20,50) + ATR_stop(2%) + WorstCase
+   manifest_hash = "def456"
+   → Cache MISS
+   → Compute → Store result
+
+4. Run 3: Donchian(20) + ATR_stop(2%) + WorstCase
+   manifest_hash = "ghi789"
+   → Cache MISS
+   → Compute → Store result
+
+5. User Changes PM param: ATR_stop(2.5%)
+   → All caches with ATR_stop(2%) INVALIDATED
+   → Rerun affected combinations
+
+6. User Reruns Run 1 (unchanged)
+   manifest_hash = "abc123"
+   → Cache HIT
+   → Return cached result (no recompute)
+
+7. Leaderboard Update:
+   - Signal-only: ranks [MA_cross(20,50), Donchian(20), MA_cross(10,20)]
+   - PM-only: ranks [Chandelier, ATR_stop]
+   - Composite: ranks all 12 runs
+```
+
+**Completion Criteria:**
+- [ ] SweepRunner runs structural + parameter exploration
+- [ ] CacheManager implements 3 cache types (features, indicators, results)
+- [ ] Cache invalidation rules enforced (param changes, dataset changes)
+- [ ] Leaderboard supports 4 categories (signal, PM, execution, composite)
+- [ ] RunManifest enables perfect reproducibility
+- [ ] BDD tests pass for cache invalidation and reproducibility
+- [ ] Integration test: full sweep with cache hits/misses
 
 ## BDD
 **Feature: Cache invalidation correctness**
@@ -5960,11 +7066,16 @@ Caching must have explicit invalidation rules.
 **Feature: Leaderboard reproducibility**
 - Scenario: leaderboard row reruns identically from manifest
 
+**Full scenarios and implementation:** [M8-walkforward-oos-specification.md](M8-walkforward-oos-specification.md)
+
 ---
 
 # M9 — Robustness ladder + stability scoring
+
+**Full Specification:** [M9-execution-monte-carlo-specification.md](M9-execution-monte-carlo-specification.md) (1,552 lines)
+
 ## Critique-driven addition
-Define what “stable enough to promote” means.
+Define what "stable enough to promote" means.
 
 ## Deliverables
 - Promotion ladder (ship minimal first):
@@ -5978,6 +7089,218 @@ Define what “stable enough to promote” means.
   - promotion uses StabilityScore threshold, not just point estimate
 - Store distributions (median, IQR, tails), not just best-case
 
+### Quick Reference Card
+
+**Core Files (8 files, ~950 lines):**
+```text
+trendlab-runner/src/robustness/
+├── mod.rs
+├── ladder.rs               # Promotion ladder orchestrator
+├── levels/
+│   ├── cheap_pass.rs       # Level 1: Deterministic + worst-case
+│   ├── walk_forward.rs     # Level 2: Train/test splits
+│   ├── execution_mc.rs     # Level 3: Slippage/spread MC
+│   ├── path_mc.rs          # Level 4: Intrabar path sampling
+│   └── bootstrap.rs        # Level 5: Block bootstrap
+├── stability/
+│   ├── scoring.rs          # Stability score calculation
+│   └── distributions.rs    # Store median, IQR, percentiles
+└── promotion.rs            # Promotion filter logic
+```
+
+**Key Traits/Structs:**
+```rust
+// Promotion ladder
+pub struct RobustnessLadder {
+    levels: Vec<Box<dyn RobustnessLevel>>,
+    promotion_filter: PromotionFilter,
+}
+
+pub trait RobustnessLevel {
+    fn name(&self) -> &str;
+    fn run(&self, candidate: &StrategyManifest) -> LevelResult;
+    fn promotion_criteria(&self) -> PromotionCriteria;
+}
+
+// Level 1: Cheap Pass (deterministic baseline)
+pub struct CheapPass {
+    execution: DeterministicExecution,
+    min_sharpe: f64,
+    min_trades: usize,
+}
+
+// Level 3: Execution Monte Carlo
+pub struct ExecutionMC {
+    trials: usize,  // e.g., 100 trials
+    slippage_dist: SlippageDistribution,
+    spread_dist: SpreadDistribution,
+}
+
+// Stability scoring
+#[derive(Debug, Clone)]
+pub struct StabilityScore {
+    metric: String,           // e.g., "sharpe"
+    median: f64,
+    iqr: f64,                 // Interquartile range
+    score: f64,               // median - penalty * IQR
+    penalty_factor: f64,      // e.g., 0.5
+}
+
+impl StabilityScore {
+    /// Penalize variance: lower IQR = higher stability
+    pub fn compute(metric: &str, values: &[f64], penalty: f64) -> Self {
+        let median = percentile(values, 0.5);
+        let q1 = percentile(values, 0.25);
+        let q3 = percentile(values, 0.75);
+        let iqr = q3 - q1;
+        let score = median - (penalty * iqr);
+
+        Self { metric: metric.into(), median, iqr, score, penalty_factor: penalty }
+    }
+}
+
+// Promotion filter
+pub struct PromotionFilter {
+    min_stability_score: f64,  // e.g., 1.0
+    max_iqr: f64,              // e.g., 0.3 (reject high variance)
+}
+
+impl PromotionFilter {
+    /// Decide if candidate promotes to next level
+    pub fn should_promote(&self, result: &LevelResult) -> bool {
+        result.stability_score.score >= self.min_stability_score
+            && result.stability_score.iqr <= self.max_iqr
+    }
+}
+
+// Distribution storage (not just point estimates)
+#[derive(Serialize, Deserialize)]
+pub struct MetricDistribution {
+    pub median: f64,
+    pub mean: f64,
+    pub iqr: f64,
+    pub percentiles: HashMap<String, f64>,  // "p10", "p90", etc.
+    pub all_values: Vec<f64>,  // Full distribution for analysis
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Stability-aware promotion
+
+  Scenario: High variance candidate rejected despite high median
+    Given Candidate A: median sharpe = 2.5, IQR = 1.0 (high variance)
+    And Candidate B: median sharpe = 2.0, IQR = 0.3 (stable)
+    And promotion filter: penalty_factor = 0.5, min_stability_score = 1.5
+    When stability scores computed:
+      | Candidate | Median | IQR | Score (median - 0.5*IQR) |
+      | A         | 2.5    | 1.0 | 2.0                      |
+      | B         | 2.0    | 0.3 | 1.85                     |
+    Then both pass threshold (score > 1.5)
+    But if min_stability_score raised to 1.9:
+      | Candidate | Score | Promoted |
+      | A         | 2.0   | Yes      |
+      | B         | 1.85  | No       |
+    Note: Stability rewards consistency, not just high median
+
+  Scenario: Low IQR candidate promoted over high median unstable one
+    Given execution MC with 100 trials
+    And Candidate A: sharpe trials = [1.5, 2.5, 0.5, 3.0, 1.0] → IQR=2.0
+    And Candidate B: sharpe trials = [1.8, 1.9, 2.0, 1.9, 2.1] → IQR=0.2
+    When promotion filter applied (max_iqr = 0.5)
+    Then Candidate A REJECTED (IQR too high = unstable)
+    And Candidate B PROMOTED (stable, predictable)
+
+Feature: Promotion gating (saves compute budget)
+
+  Scenario: Failing Cheap Pass never consumes Execution MC budget
+    Given 1000 strategy candidates
+    And Cheap Pass threshold: min_sharpe = 1.0
+    When Cheap Pass runs (fast, deterministic)
+    Then 900 candidates FAIL (sharpe < 1.0)
+    And ONLY 100 candidates promote to Walk-Forward
+    And Execution MC (expensive) runs on 100, not 1000
+    And compute budget saved: 90%
+
+  Scenario: Promotion ladder filters progressively
+    Given 1000 candidates enter Level 1 (Cheap Pass)
+    When Level 1 completes:
+      Then 100 promote to Level 2 (Walk-Forward)
+    When Level 2 completes:
+      Then 20 promote to Level 3 (Execution MC)
+    When Level 3 completes:
+      Then 5 promote to Level 4 (Path MC)
+    Result: expensive levels run on small, high-quality subset
+```
+
+**Verification Commands:**
+```bash
+# Run BDD tests
+cargo test --package trendlab-runner --test bdd_stability_scoring
+cargo test --package trendlab-runner --test bdd_promotion_gating
+
+# Expected output:
+# Feature: Stability-aware promotion
+#   Scenario: High variance candidate rejected ... ok
+#   Scenario: Low IQR candidate promoted ... ok
+# Feature: Promotion gating
+#   Scenario: Failing Cheap Pass never consumes MC budget ... ok
+#   Scenario: Promotion ladder filters progressively ... ok
+#
+# 4 scenarios (4 passed)
+
+# Run robustness ladder (integration test)
+cargo run --package trendlab-runner --bin robustness -- \
+  --candidates manifests/*.json \
+  --level1 cheap_pass --threshold 1.0 \
+  --level2 walk_forward --splits 5 \
+  --level3 execution_mc --trials 100
+
+# Expected: Progressive filtering, stability scores reported, distributions saved
+```
+
+**Example Flow: Promotion Ladder**
+```text
+1. Input: 1000 strategy candidates
+
+2. Level 1: Cheap Pass (deterministic)
+   - Run: Deterministic execution, WorstCase path policy
+   - Filter: Sharpe > 1.0
+   - Output: 100 candidates promote (900 rejected)
+   - Cost: Low (fast, single run per candidate)
+
+3. Level 2: Walk-Forward (5 splits)
+   - Run: Train on 80%, test on 20%, roll forward
+   - Filter: OOS Sharpe > 0.8, trades > 10
+   - Output: 20 candidates promote (80 rejected)
+   - Cost: Medium (5 runs per candidate)
+
+4. Level 3: Execution MC (100 trials)
+   - Run: Sample slippage/spread distributions
+   - Compute: Median sharpe, IQR
+   - Stability score: median - 0.5 * IQR
+   - Filter: stability_score > 1.5, IQR < 0.3
+   - Output: 5 candidates promote (15 rejected)
+   - Cost: High (100 runs per candidate)
+
+5. Level 4: Path MC (later)
+   - Run: Intrabar path sampling
+   - Output: Top 2 candidates with full uncertainty quantification
+
+6. Final Result:
+   - 1000 → 100 → 20 → 5 → 2 (progressively filtered)
+   - Expensive levels run only on high-quality subset
+   - Stability scoring prevents overfitting to lucky paths
+```
+
+**Completion Criteria:**
+- [ ] RobustnessLadder orchestrates 3 levels (Cheap, Walk-Forward, Execution MC)
+- [ ] StabilityScore penalizes variance (median - penalty * IQR)
+- [ ] PromotionFilter gates expensive levels
+- [ ] MetricDistribution stores full distribution (not just point estimates)
+- [ ] BDD tests pass for stability scoring and promotion gating
+- [ ] Integration test: 100 candidates → ladder → top 5 promoted
+
 ## BDD
 **Feature: Stability-aware promotion**
 - Scenario: higher median but high variance ranks below slightly lower median with low variance
@@ -5985,26 +7308,337 @@ Define what “stable enough to promote” means.
 **Feature: Promotion gating**
 - Scenario: failing Cheap Pass never consumes Execution MC budget
 
+**Full scenarios and implementation:** [M9-execution-monte-carlo-specification.md](M9-execution-monte-carlo-specification.md)
+
 ---
 
 # M10 — TUI v3 + drill-down explainability + ghost curve
+
+**Full Specification:** [M10-path-monte-carlo-specification.md](M10-path-monte-carlo-specification.md) (1,462 lines)
+
 ## Critique-driven additions
 - Drill-down path must be explicit.
-- “Ghost curve” shows execution drag (ideal vs real fills).
+- "Ghost curve" shows execution drag (ideal vs real fills).
 
 ## Deliverables
 - Theme tokens (Parrot/neon)
 - Core panels (MVP):
   - Leaderboard, Chart, Trade Tape, Execution Lab
+  - **Rejected Intents view** (critical for debugging "why did strategy stop trading?")
 - **Drill-down flow**
   1) Leaderboard → select row → summary card
   2) Enter → trade tape
   3) Enter on trade → chart jump to entry/exit
   4) `d` → diagnostics (slippage, gaps, ambiguities)
-  5) `r` → rerun with new execution preset
+  5) `i` → rejected intents (signals blocked by PM/OrderPolicy/Sizer)
+  6) `r` → rerun with new execution preset
 - **Ghost curve**
-  - store “ideal equity” vs “real equity” (execution-drag)
+  - store "ideal equity" vs "real equity" (execution-drag)
   - compute and display Execution Drag metric
+- **Rejected intents tracking (critical for debugging "why stopped trading")**:
+  - Persist event log: signal emitted `Long` but OrderPolicy blocked with specific reason
+  - **4 rejection types to track:**
+    1. `VolatilityGuard`: ATR exceeded threshold → PM blocked entry
+    2. `LiquidityGuard`: Participation limit would be violated → Sizer reduced qty to 0
+    3. `MarginGuard`: Insufficient buying power → Portfolio blocked order
+    4. `RiskGuard`: Max position size/count exceeded → PM blocked entry
+  - Show timeline of rejected intents with counts per rejection type
+  - Display rejection rate per strategy (e.g., "87% of signals rejected due to VolatilityGuard")
+  - Critical for trend-following diagnostics: most failures are "missed trades" not "bad trades"
+
+### Quick Reference Card
+
+**Core Files (16 files, ~1,800 lines):**
+```text
+trendlab-tui/src/
+├── main.rs                 # TUI entry point
+├── app.rs                  # App state + navigation
+├── theme.rs                # Parrot/neon theme tokens
+├── panels/
+│   ├── mod.rs
+│   ├── leaderboard.rs      # Main leaderboard view
+│   ├── chart.rs            # Equity curve + trade markers
+│   ├── trade_tape.rs       # Trade list with details
+│   ├── rejected_intents.rs # Rejected signals timeline (critical diagnostic)
+│   └── execution_lab.rs    # Execution sensitivity analysis
+├── drill_down/
+│   ├── mod.rs
+│   ├── flow.rs             # Drill-down state machine
+│   ├── summary_card.rs     # Strategy summary overlay
+│   └── diagnostics.rs      # Fill diagnostics (gaps, slippage)
+├── ghost_curve/
+│   ├── mod.rs
+│   ├── ideal_equity.rs     # Ideal fills (no drag)
+│   ├── real_equity.rs      # Actual fills (with drag)
+│   └── drag_metric.rs      # Execution drag calculation
+└── navigation.rs           # Keyboard navigation
+```
+
+**Key Structs:**
+```rust
+// Theme tokens (Parrot/neon)
+pub struct Theme {
+    pub background: Color,       // Near-black
+    pub accent: Color,           // Electric cyan
+    pub positive: Color,         // Neon green
+    pub negative: Color,         // Hot pink
+    pub warning: Color,          // Neon orange
+    pub neutral: Color,          // Cool purple
+    pub muted: Color,            // Steel blue
+}
+
+// Drill-down state machine
+pub enum DrillDownState {
+    Leaderboard,              // Main view
+    SummaryCard(RunId),       // Overlay with strategy summary
+    TradeTape(RunId),         // Trade list
+    RejectedIntents(RunId),   // Rejected signals timeline (shows why strategy stopped trading)
+    ChartWithTrade(RunId, TradeId),  // Chart focused on specific trade
+    Diagnostics(RunId, TradeId),     // Fill diagnostics
+    ExecutionLab(RunId),      // Rerun with different execution
+}
+
+// Ghost curve (ideal vs real)
+pub struct GhostCurve {
+    pub ideal_equity: Vec<f64>,   // Equity if all fills at ideal prices
+    pub real_equity: Vec<f64>,    // Actual equity with slippage/spread
+    pub drag_metric: f64,         // (ideal - real) / ideal
+    pub timestamps: Vec<DateTime<Utc>>,
+}
+
+impl GhostCurve {
+    /// Render both curves with drag shaded area
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        // Plot ideal in muted color (ghost)
+        // Plot real in accent color (primary)
+        // Shade area between curves (drag visualization)
+    }
+
+    /// Compute execution drag percentage
+    pub fn drag_percentage(&self) -> f64 {
+        let final_ideal = self.ideal_equity.last().unwrap();
+        let final_real = self.real_equity.last().unwrap();
+        ((final_ideal - final_real) / final_ideal) * 100.0
+    }
+}
+
+// Drill-down navigation
+pub struct DrillDownFlow {
+    state: DrillDownState,
+    history: Vec<DrillDownState>,  // Navigation stack
+}
+
+impl DrillDownFlow {
+    /// Navigate forward in drill-down
+    pub fn drill_down(&mut self, target: DrillDownState) {
+        self.history.push(self.state.clone());
+        self.state = target;
+    }
+
+    /// Navigate back
+    pub fn back(&mut self) {
+        if let Some(prev) = self.history.pop() {
+            self.state = prev;
+        }
+    }
+
+    /// Keyboard shortcuts
+    /// - Enter: drill down (leaderboard → tape → chart)
+    /// - Esc/Backspace: back
+    /// - d: diagnostics
+    /// - i: rejected intents (show blocked signals)
+    /// - r: rerun with new execution
+}
+
+// Rejected intent record (for debugging "why did strategy stop trading?")
+pub struct RejectedIntent {
+    pub bar_index: usize,
+    pub timestamp: DateTime<Utc>,
+    pub signal: SignalIntent,      // What signal wanted to do (Long/Short/Flat)
+    pub rejection_reason: RejectionReason,
+    pub context: HashMap<String, f64>,  // e.g., volatility=0.05, cash=0
+}
+
+pub enum RejectionReason {
+    InsufficientCash,
+    VolatilityTooHigh,
+    PositionSizeTooSmall,
+    OrderPolicyBlocked(String),
+    SizerRejected(String),
+    Other(String),
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Drill-down explainability
+
+  Scenario: User traces from leaderboard to trade details
+    Given leaderboard showing top 10 strategies
+    When user selects row #1 (sharpe=2.5)
+    And presses Enter
+    Then summary card overlay appears with:
+      | Field           | Value                      |
+      | Strategy        | MA_cross(20,50) + ATR_stop |
+      | Sharpe          | 2.5                        |
+      | Total Return    | 45%                        |
+      | Trades          | 25                         |
+      | Win Rate        | 64%                        |
+
+    When user presses Enter again
+    Then trade tape opens showing all 25 trades
+
+    When user selects trade #3 (biggest winner)
+    And presses Enter
+    Then chart opens focused on trade #3
+    And entry marker shown at bar 45
+    And exit marker shown at bar 67
+    And PnL annotation: "+$1,250"
+
+    When user presses 'd' (diagnostics)
+    Then diagnostics panel shows:
+      | Field          | Value                    |
+      | Entry Fill     | $105.23 (slippage: $0.23)|
+      | Exit Fill      | $118.50 (slippage: $0.50)|
+      | Gap Fill       | No                       |
+      | Ambiguity      | Stop hit first (WorstCase)|
+
+Feature: Ghost curve shows execution drag
+
+  Scenario: Ghost curve visualizes ideal vs real equity
+    Given a backtest result with execution drag
+    When user opens chart panel
+    Then two equity curves displayed:
+      - Ghost curve (muted): ideal fills (no slippage)
+      - Primary curve (accent): real fills (with drag)
+    And shaded area between curves represents drag
+    And drag metric displayed: "Execution Drag: -3.2%"
+
+  Scenario: Execution drag calculation
+    Given ideal final equity = $12,000 (perfect fills)
+    And real final equity = $11,600 (with slippage/spread)
+    When drag metric computed
+    Then drag = ((12000 - 11600) / 12000) * 100 = 3.33%
+    And displayed as: "Execution Drag: -3.3%"
+
+Feature: Execution Lab (sensitivity analysis)
+
+  Scenario: User reruns with different execution preset
+    Given current run uses WorstCase execution
+    And sharpe = 2.5
+    When user presses 'r' (rerun)
+    Then execution preset selector appears:
+      [ ] Deterministic
+      [x] WorstCase (current)
+      [ ] MC_100_trials
+      [ ] Custom
+    When user selects "Deterministic"
+    And confirms
+    Then backtest reruns with Deterministic execution
+    And results compared side-by-side:
+      | Preset       | Sharpe | Return | Drag   |
+      | WorstCase    | 2.5    | 45%    | -3.2%  |
+      | Deterministic| 2.7    | 48%    | -2.1%  |
+```
+
+**Verification Commands:**
+```bash
+# Create TUI workspace
+cargo new --bin trendlab-tui
+
+# Add dependencies (Cargo.toml)
+# [dependencies]
+# ratatui = "0.28"
+# crossterm = "0.28"
+
+# Run TUI
+cargo run --package trendlab-tui
+
+# Expected: TUI opens with leaderboard panel, theme applied
+
+# Test drill-down flow (manual)
+# 1. Select row → Enter → summary card appears
+# 2. Enter → trade tape opens
+# 3. Select trade → Enter → chart focused on trade
+# 4. Press 'd' → diagnostics panel
+# 5. Press Esc → back to trade tape
+# 6. Press Esc → back to summary card
+# 7. Press Esc → back to leaderboard
+
+# Test ghost curve (manual)
+# Open chart panel → verify two curves (ideal + real) → verify drag metric
+```
+
+**Example Drill-Down Flow:**
+```text
+Step 1: Leaderboard View
+┌──────────────────────────────────────────────────┐
+│ Rank | Strategy           | Sharpe | Return | ... │
+│  1   | MA_cross + ATR     | 2.5    | 45%    | ... │ ← Selected
+│  2   | Donchian + Chand   | 2.3    | 42%    | ... │
+│  3   | RSI + Fixed        | 2.1    | 38%    | ... │
+└──────────────────────────────────────────────────┘
+Press Enter to view details
+
+Step 2: Summary Card Overlay
+┌──────────────────────────────────────────────────┐
+│ ┌───────────────────────────────────────────┐    │
+│ │ Strategy: MA_cross(20,50) + ATR_stop(2%)  │    │
+│ │ Sharpe: 2.5                               │    │
+│ │ Total Return: 45%                         │    │
+│ │ Trades: 25                                │    │
+│ │                                           │    │
+│ │ [Enter: Trade Tape] [Esc: Back]          │    │
+│ └───────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────┘
+
+Step 3: Trade Tape
+┌──────────────────────────────────────────────────┐
+│ # | Entry   | Exit    | PnL      | Return | ... │
+│ 1 | 2023-01 | 2023-02 | +$850    | 12%    | ... │
+│ 2 | 2023-03 | 2023-04 | -$320    | -4%    | ... │
+│ 3 | 2023-05 | 2023-07 | +$1,250  | 18%    | ... │ ← Selected
+└──────────────────────────────────────────────────┘
+Press Enter to view on chart
+
+Step 4: Chart with Trade Focus
+┌──────────────────────────────────────────────────┐
+│              Equity Curve                        │
+│                                                  │
+│       [Entry]              [Exit]                │
+│         ↓                    ↓                   │
+│    ●────────────────────────●                    │
+│   /                          \                   │
+│  /                            \                  │
+│ /  PnL: +$1,250 (18%)          \                 │
+│                                                  │
+│ [d: Diagnostics] [Esc: Back]                     │
+└──────────────────────────────────────────────────┘
+
+Step 5: Diagnostics Panel (press 'd')
+┌──────────────────────────────────────────────────┐
+│ Trade #3 Diagnostics                             │
+│                                                  │
+│ Entry Fill:    $105.23                           │
+│   Slippage:    $0.23 (0.22%)                     │
+│   Gap Fill:    No                                │
+│                                                  │
+│ Exit Fill:     $118.50                           │
+│   Slippage:    $0.50 (0.42%)                     │
+│   Ambiguity:   Stop hit first (WorstCase)        │
+│                                                  │
+│ [Esc: Back to Chart]                             │
+└──────────────────────────────────────────────────┘
+```
+
+**Completion Criteria:**
+- [ ] Theme tokens implemented (Parrot/neon colors)
+- [ ] 4 core panels: Leaderboard, Chart, Trade Tape, Execution Lab
+- [ ] Drill-down flow: leaderboard → summary → tape → chart → diagnostics
+- [ ] Ghost curve: ideal vs real equity with drag metric
+- [ ] Keyboard navigation: Enter (drill down), Esc (back), d (diagnostics), r (rerun)
+- [ ] Manual testing: verify full drill-down path works
+- [ ] Ghost curve displays correctly with shaded drag area
 
 ## BDD
 **Feature: Drill-down explainability**
@@ -6013,21 +7647,324 @@ Define what “stable enough to promote” means.
 **Feature: Execution drag visualization**
 - Scenario: run result contains both ideal and real equity and computed drag
 
+**Full scenarios and implementation:** [M10-path-monte-carlo-specification.md](M10-path-monte-carlo-specification.md)
+
 ---
 
 # M11 — Reporting & artifacts
+
+**Full Specification:** [M11-bootstrap-regime-resampling-specification.md](M11-bootstrap-regime-resampling-specification.md) (1,043 lines)
+
 ## Deliverables
 - Run artifacts:
   - manifest, equity, trades, diagnostics
 - Optional: one-page markdown report per run (composition + metrics + robustness summaries)
 
+### Quick Reference Card
+
+**Core Files (8 files, ~800 lines):**
+```text
+trendlab-runner/src/reporting/
+├── mod.rs
+├── artifacts/
+│   ├── mod.rs              # Artifact manager
+│   ├── manifest.rs         # Manifest export (JSON/YAML)
+│   ├── equity.rs           # Equity curve export (CSV/Parquet)
+│   ├── trades.rs           # Trade tape export (CSV/JSON)
+│   └── diagnostics.rs      # Diagnostics export (JSON)
+├── reports/
+│   ├── mod.rs              # Report generator
+│   ├── markdown.rs         # Markdown report template
+│   └── summary.rs          # Summary statistics
+└── export.rs               # Export orchestrator
+```
+
+**Key Structs:**
+```rust
+// Artifact manager (persist all run outputs)
+pub struct ArtifactManager {
+    output_dir: PathBuf,
+}
+
+impl ArtifactManager {
+    /// Save complete run artifacts
+    pub fn save_run(&self, run_id: &RunId, result: &RunResult) -> Result<ArtifactPaths> {
+        // 1. Manifest (config + dataset + seed)
+        let manifest_path = self.save_manifest(run_id, &result.manifest)?;
+
+        // 2. Equity curve (timestamp + equity)
+        let equity_path = self.save_equity(run_id, &result.equity_curve)?;
+
+        // 3. Trade tape (entry/exit/pnl for each trade)
+        let trades_path = self.save_trades(run_id, &result.trades)?;
+
+        // 4. Diagnostics (slippage, gaps, ambiguities)
+        let diagnostics_path = self.save_diagnostics(run_id, &result.diagnostics)?;
+
+        Ok(ArtifactPaths {
+            manifest: manifest_path,
+            equity: equity_path,
+            trades: trades_path,
+            diagnostics: diagnostics_path,
+        })
+    }
+}
+
+// Artifact paths (returned after save)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactPaths {
+    pub manifest: PathBuf,
+    pub equity: PathBuf,
+    pub trades: PathBuf,
+    pub diagnostics: PathBuf,
+}
+
+// Markdown report generator (optional one-pager)
+pub struct MarkdownReportGenerator;
+
+impl MarkdownReportGenerator {
+    /// Generate one-page markdown report
+    pub fn generate(&self, result: &RunResult) -> String {
+        format!(
+            r#"# Backtest Report: {strategy}
+
+## Strategy Composition
+- **Signal:** {signal}
+- **Position Manager:** {pm}
+- **Execution Preset:** {execution}
+- **Sizer:** {sizer}
+
+## Performance Metrics
+| Metric           | Value    |
+|------------------|----------|
+| Total Return     | {return}% |
+| Sharpe Ratio     | {sharpe} |
+| Max Drawdown     | {mdd}%   |
+| Win Rate         | {win_rate}% |
+| Total Trades     | {trades} |
+
+## Robustness Summary
+- **Walk-Forward OOS Sharpe:** {oos_sharpe}
+- **Execution MC Median:** {mc_median}
+- **Stability Score:** {stability}
+
+## Top 3 Trades (by PnL)
+{top_trades}
+
+## Diagnostics
+- **Gap Fills:** {gap_fills}
+- **Ambiguities (WorstCase):** {ambiguities}
+- **Execution Drag:** {drag}%
+
+---
+*Generated by TrendLab v3 on {timestamp}*
+"#,
+            strategy = result.manifest.strategy_name(),
+            signal = result.manifest.signal_name,
+            pm = result.manifest.pm_name,
+            execution = result.manifest.execution_preset,
+            sizer = result.manifest.sizer,
+            return = result.metrics.total_return,
+            sharpe = result.metrics.sharpe_ratio,
+            mdd = result.metrics.max_drawdown,
+            win_rate = result.metrics.win_rate,
+            trades = result.trades.len(),
+            oos_sharpe = result.robustness.oos_sharpe.unwrap_or(0.0),
+            mc_median = result.robustness.mc_median.unwrap_or(0.0),
+            stability = result.robustness.stability_score.unwrap_or(0.0),
+            top_trades = self.format_top_trades(&result.trades),
+            gap_fills = result.diagnostics.gap_fills,
+            ambiguities = result.diagnostics.ambiguities,
+            drag = result.diagnostics.execution_drag,
+            timestamp = Utc::now(),
+        )
+    }
+
+    fn format_top_trades(&self, trades: &[Trade]) -> String {
+        // Format top 3 trades as markdown table
+        // ...
+    }
+}
+
+// Export formats
+pub enum ExportFormat {
+    Json,
+    Csv,
+    Parquet,
+    Yaml,
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Explainability artifacts exist for every run
+
+  Scenario: Every leaderboard row has complete artifacts
+    Given a completed backtest run with run_id "abc123:def456:42"
+    When the run completes successfully
+    Then the following artifacts exist:
+      | Artifact    | Path                                      |
+      | Manifest    | artifacts/abc123_def456_42/manifest.json  |
+      | Equity      | artifacts/abc123_def456_42/equity.csv     |
+      | Trades      | artifacts/abc123_def456_42/trades.csv     |
+      | Diagnostics | artifacts/abc123_def456_42/diagnostics.json |
+
+  Scenario: Manifest enables perfect reproduction
+    Given artifact manifest.json:
+      ```json
+      {
+        "config_id": "abc123",
+        "dataset_hash": "def456",
+        "seed": 42,
+        "strategy": {
+          "signal": "MA_cross(20,50)",
+          "pm": "ATR_stop(2%)",
+          "execution": "WorstCase",
+          "sizer": "Fixed(100)"
+        }
+      }
+      ```
+    When I load the manifest and rerun the backtest
+    Then the results match exactly:
+      | Field         | Original | Rerun   |
+      | Sharpe        | 2.5      | 2.5     |
+      | Total Return  | 45%      | 45%     |
+      | Trades        | 25       | 25      |
+
+  Scenario: Trade tape export includes all trade details
+    Given a backtest with 3 completed trades
+    When I export the trade tape to CSV
+    Then the CSV contains:
+      | trade_id | entry_time | entry_price | exit_time | exit_price | qty | pnl   | commission |
+      | 1        | 2023-01-15 | 100.50      | 2023-02-10| 110.25     | 100 | 975.00| 2.00       |
+      | 2        | 2023-03-05 | 112.00      | 2023-03-20| 108.50     | 100 | -350.00| 2.00      |
+      | 3        | 2023-05-12 | 115.75      | 2023-07-08| 128.90     | 100 | 1315.00| 2.00      |
+
+Feature: Markdown report generation (optional)
+
+  Scenario: One-page report summarizes strategy and results
+    Given a completed backtest run
+    When I generate a markdown report
+    Then the report contains sections:
+      - Strategy Composition (signal + PM + execution + sizer)
+      - Performance Metrics (table with return, sharpe, mdd, win rate, trades)
+      - Robustness Summary (OOS sharpe, MC median, stability score)
+      - Top 3 Trades (by PnL)
+      - Diagnostics (gap fills, ambiguities, execution drag)
+    And the report is readable as a standalone document
+```
+
+**Verification Commands:**
+```bash
+# Run BDD tests
+cargo test --package trendlab-runner --test bdd_artifacts_exist
+cargo test --package trendlab-runner --test bdd_manifest_reproducibility
+
+# Expected output:
+# Feature: Explainability artifacts exist
+#   Scenario: Every leaderboard row has complete artifacts ... ok
+#   Scenario: Manifest enables perfect reproduction ... ok
+#   Scenario: Trade tape export includes all trade details ... ok
+# Feature: Markdown report generation
+#   Scenario: One-page report summarizes strategy and results ... ok
+#
+# 4 scenarios (4 passed)
+
+# Integration test: Save artifacts for a run
+cargo run --package trendlab-runner --bin save_artifacts -- \
+  --run-id abc123:def456:42 \
+  --output-dir artifacts/
+
+# Expected: 4 files created (manifest.json, equity.csv, trades.csv, diagnostics.json)
+
+# Generate markdown report
+cargo run --package trendlab-runner --bin generate_report -- \
+  --run-id abc123:def456:42 \
+  --format markdown \
+  --output report.md
+
+# Expected: report.md created with all sections
+```
+
+**Example Artifact Structure:**
+```text
+artifacts/
+├── abc123_def456_42/          # Run directory (config_dataset_seed)
+│   ├── manifest.json          # Full config + metadata
+│   ├── equity.csv             # Timestamp + equity values
+│   ├── trades.csv             # Trade tape (entry/exit/pnl)
+│   ├── diagnostics.json       # Slippage, gaps, ambiguities
+│   └── report.md              # Optional markdown report
+└── xyz789_ghi012_99/
+    ├── manifest.json
+    ├── equity.csv
+    ├── trades.csv
+    ├── diagnostics.json
+    └── report.md
+```
+
+**Example Manifest (JSON):**
+```json
+{
+  "run_id": {
+    "config_id": "abc123",
+    "dataset_hash": "def456",
+    "seed": 42
+  },
+  "strategy": {
+    "signal": {
+      "name": "MA_cross",
+      "params": {
+        "fast": 20,
+        "slow": 50
+      }
+    },
+    "position_manager": {
+      "name": "ATR_stop",
+      "params": {
+        "atr_mult": 2.0,
+        "ratchet_enabled": true
+      }
+    },
+    "execution_preset": "WorstCase",
+    "sizer": {
+      "name": "Fixed",
+      "params": {
+        "quantity": 100
+      }
+    }
+  },
+  "dataset": {
+    "hash": "def456",
+    "symbols": ["SPY"],
+    "date_range": ["2020-01-01", "2023-12-31"]
+  },
+  "timestamp": "2026-02-04T12:34:56Z"
+}
+```
+
+**Completion Criteria:**
+- [ ] ArtifactManager saves 4 artifact types (manifest, equity, trades, diagnostics)
+- [ ] Manifest exports to JSON/YAML
+- [ ] Equity curve exports to CSV/Parquet
+- [ ] Trade tape exports to CSV/JSON
+- [ ] Diagnostics export to JSON
+- [ ] MarkdownReportGenerator creates one-page report
+- [ ] BDD tests pass for artifact existence and reproducibility
+- [ ] Integration test: full run → artifacts saved → manifest rerun matches
+
 ## BDD
 **Feature: Explainability artifacts exist**
 - Scenario: every leaderboard row has manifest + trade tape export
 
+**Full scenarios and implementation:** [M11-bootstrap-regime-resampling-specification.md](M11-bootstrap-regime-resampling-specification.md)
+
 ---
 
 # M12 — Hardening (perf + regression + docs)
+
+**Full Specification:** [M12-benchmarks-ui-polish-specification.md](M12-benchmarks-ui-polish-specification.md) (971 lines)
+
 ## Deliverables
 - Criterion benches: bar loop, order book ops, execution fills
 - Regression suite:
@@ -6037,9 +7974,340 @@ Define what “stable enough to promote” means.
   - how to add signals/PM/order policies
   - how to interpret presets and robustness distributions
 
+### M12 Hard-Fail Integration Tests ("v3 Done" Criteria)
+
+These three tests must pass before v3 is considered production-ready:
+
+| Test | Objective | Success Metric |
+|------|-----------|----------------|
+| **Concurrency Torture** | No race conditions | 16-thread sweep vs 1-thread sweep: bit-for-bit identical results |
+| **Death Crossing** | Identify execution-fragile strategies | Flag any strategy where Ghost Curve and Real Curve diverge >15% |
+| **Cache Mutation** | Verify data integrity | Manually delete `.cache` file; "Rerun" in TUI reproduces exact equity curve |
+
+**Implementation:**
+
+```rust
+#[test]
+fn hard_fail_concurrency_torture() {
+    let config = load_test_config();
+    let single_thread = run_backtest(config.clone(), threads=1);
+    let multi_thread = run_backtest(config.clone(), threads=16);
+
+    assert_eq!(single_thread.equity_curve, multi_thread.equity_curve,
+        "Concurrency produced different equity curves");
+    assert_eq!(single_thread.trades, multi_thread.trades,
+        "Concurrency produced different trade sequences");
+}
+
+#[test]
+fn hard_fail_death_crossing() {
+    let results = run_full_sweep();
+    let flagged = results.iter()
+        .filter(|r| r.execution_divergence() > 0.15)
+        .collect::<Vec<_>>();
+
+    // Log flagged strategies (don't fail, but warn)
+    for r in flagged {
+        eprintln!("⚠ Execution-fragile: {} (divergence: {:.1}%)",
+            r.config_id, r.execution_divergence() * 100.0);
+    }
+
+    // This test documents execution-fragile strategies but doesn't fail the build
+    // The flagged list is used for deprioritization in final selection
+}
+
+#[test]
+fn hard_fail_cache_mutation() {
+    let run_id = RunId::new(
+        ConfigId::from_hash("test_abc123"),
+        DatasetHash::from_hash("test_def456"),
+        42
+    );
+
+    let equity_1 = run_backtest(run_id.clone());
+
+    // Delete cache
+    std::fs::remove_file(".cache/results.cache")
+        .expect("Failed to delete cache");
+
+    let equity_2 = run_backtest(run_id.clone());
+
+    assert_eq!(equity_1, equity_2,
+        "Cache mutation broke reproducibility: equity curves differ");
+}
+```
+
+### Quick Reference Card
+
+**Core Files (10 files, ~900 lines):**
+```text
+trendlab-core/
+├── benches/
+│   ├── bar_loop.rs         # Event loop performance
+│   ├── order_book.rs       # Order book operations
+│   ├── execution.rs        # Fill simulation
+│   └── end_to_end.rs       # Full backtest bench
+├── tests/
+│   ├── golden/
+│   │   ├── synthetic_A.rs  # Golden dataset A
+│   │   ├── synthetic_B.rs  # Golden dataset B
+│   │   └── snapshots/      # Insta snapshots
+│   └── property/
+│       ├── no_double_fill.rs
+│       ├── oco_invariant.rs
+│       └── equity_accounting.rs
+└── docs/
+    ├── adding_signals.md
+    ├── adding_pm.md
+    ├── execution_presets.md
+    └── robustness_guide.md
+```
+
+**Key Benchmarks:**
+```rust
+// Criterion benchmark for event loop
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
+fn bench_bar_loop(c: &mut Criterion) {
+    let bars = generate_synthetic_bars(1000);
+    let engine = Engine::new(10000.0, 20);
+
+    c.bench_function("bar_loop_1000_bars", |b| {
+        b.iter(|| {
+            let mut eng = engine.clone();
+            for bar in &bars {
+                eng.process_bar(black_box(bar), &prices);
+            }
+        })
+    });
+}
+
+criterion_group!(benches, bench_bar_loop);
+criterion_main!(benches);
+
+// Performance targets:
+// - bar_loop: < 10µs per bar
+// - order_book insert: < 1µs
+// - fill simulation: < 5µs
+```
+
+**Golden Regression Tests:**
+```rust
+use insta::assert_yaml_snapshot;
+
+#[test]
+fn test_golden_synthetic_world_a() {
+    // Synthetic world A: 100 bars, trending market
+    let bars = load_golden_synthetic_a();
+    let result = run_backtest_with_manifest("golden_a_manifest.json");
+
+    // Snapshot equity curve + trades
+    assert_yaml_snapshot!("synthetic_a_equity", result.equity_curve);
+    assert_yaml_snapshot!("synthetic_a_trades", result.trades);
+
+    // Exact value checks
+    assert_eq!(result.final_equity, 10523.45);
+    assert_eq!(result.trades.len(), 15);
+}
+
+#[test]
+fn test_golden_synthetic_world_b() {
+    // Synthetic world B: 200 bars, choppy market
+    let bars = load_golden_synthetic_b();
+    let result = run_backtest_with_manifest("golden_b_manifest.json");
+
+    assert_yaml_snapshot!("synthetic_b_equity", result.equity_curve);
+    assert_yaml_snapshot!("synthetic_b_trades", result.trades);
+
+    assert_eq!(result.final_equity, 9876.32);
+    assert_eq!(result.trades.len(), 28);
+}
+```
+
+**Property Tests (Invariants):**
+```rust
+use proptest::prelude::*;
+
+// Property: No position should be filled twice
+proptest! {
+    #[test]
+    fn prop_no_double_fill(bars in any_bars(100)) {
+        let result = run_backtest(bars);
+        let fill_ids: Vec<_> = result.fills.iter().map(|f| &f.id).collect();
+        let unique_fills: std::collections::HashSet<_> = fill_ids.iter().collect();
+
+        // Assert: all fill IDs are unique (no double fills)
+        prop_assert_eq!(fill_ids.len(), unique_fills.len());
+    }
+
+    #[test]
+    fn prop_oco_consistency(bars in any_bars(100)) {
+        let result = run_backtest_with_oco_orders(bars);
+
+        // Assert: OCO pairs never both filled
+        for oco_pair in result.oco_pairs {
+            let filled_count = oco_pair.orders
+                .iter()
+                .filter(|o| o.state == OrderState::Filled)
+                .count();
+            prop_assert!(filled_count <= 1, "OCO pair had both orders filled");
+        }
+    }
+
+    #[test]
+    fn prop_equity_accounting(bars in any_bars(100)) {
+        let result = run_backtest(bars);
+
+        // Assert: equity = cash + position value
+        let final_cash = result.accounting.cash();
+        let position_value: f64 = result.positions
+            .iter()
+            .map(|p| p.market_value(result.final_prices[&p.symbol]))
+            .sum();
+
+        prop_assert!((result.final_equity - (final_cash + position_value)).abs() < 0.01);
+    }
+}
+```
+
+**BDD Scenarios (Sample):**
+```gherkin
+Feature: Regression protection with golden datasets
+
+  Scenario: Golden synthetic world A remains unchanged
+    Given golden synthetic dataset A (trending market, 100 bars)
+    When I run backtest with manifest "golden_a_manifest.json"
+    Then final equity is exactly $10,523.45
+    And trade count is exactly 15
+    And equity curve snapshot matches "synthetic_a_equity.yaml"
+    And trade list snapshot matches "synthetic_a_trades.yaml"
+
+  Scenario: Golden synthetic world B remains unchanged
+    Given golden synthetic dataset B (choppy market, 200 bars)
+    When I run backtest with manifest "golden_b_manifest.json"
+    Then final equity is exactly $9,876.32
+    And trade count is exactly 28
+    And equity curve snapshot matches "synthetic_b_equity.yaml"
+
+Feature: Performance benchmarks meet targets
+
+  Scenario: Bar loop performance meets target
+    Given 1000 synthetic bars
+    When I benchmark the event loop
+    Then average time per bar is < 10µs
+
+  Scenario: Order book operations meet targets
+    When I benchmark order book insert
+    Then average insert time is < 1µs
+    When I benchmark order book cancel
+    Then average cancel time is < 500ns
+
+Feature: Documentation completeness
+
+  Scenario: All extension points documented
+    When I check documentation
+    Then "adding_signals.md" exists with examples
+    And "adding_pm.md" exists with examples
+    And "execution_presets.md" explains all presets
+    And "robustness_guide.md" explains promotion ladder
+```
+
+**Verification Commands:**
+```bash
+# Run benchmarks
+cargo bench --package trendlab-core
+
+# Expected output:
+# bar_loop_1000_bars      time:   [8.2 µs 8.5 µs 8.8 µs]
+# order_book_insert       time:   [650 ns 680 ns 720 ns]
+# execution_fill          time:   [4.1 µs 4.3 µs 4.6 µs]
+
+# Run golden regression tests
+cargo test --package trendlab-core golden
+
+# Expected: All snapshots match
+
+# Run property tests
+cargo test --package trendlab-core prop_
+
+# Expected:
+# prop_no_double_fill ... ok (100 cases)
+# prop_oco_consistency ... ok (100 cases)
+# prop_equity_accounting ... ok (100 cases)
+
+# Check documentation
+ls docs/
+# Expected: adding_signals.md, adding_pm.md, execution_presets.md, robustness_guide.md
+
+# Run full regression suite
+cargo test --workspace --release
+
+# Expected: All tests pass, no regressions
+```
+
+**Example Documentation Structure:**
+
+**File: `docs/adding_signals.md`**
+```markdown
+# Adding New Signals
+
+## Signal Trait
+
+All signals implement the `Signal` trait:
+
+\`\`\`rust
+pub trait Signal {
+    fn generate(&self, bars: &[Bar]) -> SignalIntent;
+    fn name(&self) -> &str;
+}
+\`\`\`
+
+## Example: RSI Signal
+
+\`\`\`rust
+pub struct RsiSignal {
+    period: usize,
+    oversold: f64,
+    overbought: f64,
+}
+
+impl Signal for RsiSignal {
+    fn generate(&self, bars: &[Bar]) -> SignalIntent {
+        let rsi = compute_rsi(bars, self.period);
+        if rsi < self.oversold {
+            SignalIntent::Long
+        } else if rsi > self.overbought {
+            SignalIntent::Short
+        } else {
+            SignalIntent::Flat
+        }
+    }
+
+    fn name(&self) -> &str {
+        "RSI"
+    }
+}
+\`\`\`
+
+## Registration
+
+Add to signal registry in `signals/mod.rs`.
+```
+
+**Completion Criteria:**
+- [ ] Criterion benchmarks exist for bar loop, order book, execution
+- [ ] Performance targets met (bar loop < 10µs, order book ops < 1µs)
+- [ ] 2+ golden synthetic datasets with snapshot tests
+- [ ] Property tests for no_double_fill, OCO, equity accounting
+- [ ] Documentation exists for signals, PM, execution presets, robustness
+- [ ] Full regression suite passes in CI
+- [ ] BDD tests pass for regression protection
+
 ## BDD
 **Feature: Regression protection**
 - Scenario: golden synthetic worlds remain unchanged unless explicitly updated
+
+**Full scenarios and implementation:** [M12-benchmarks-ui-polish-specification.md](M12-benchmarks-ui-polish-specification.md)
 
 ---
 

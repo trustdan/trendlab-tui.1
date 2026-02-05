@@ -1,0 +1,249 @@
+# TrendLab v3 .gitignore
+
+# ============================================================================
+# Rust
+# ============================================================================
+
+# Compiled files
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock (uncomment if building a library, keep if building binary)
+# Cargo.lock
+
+# Cargo build artifacts
+**/*.rmeta
+
+# ============================================================================
+# IDE / Editor
+# ============================================================================
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs (IntelliJ, CLion, RustRover)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ============================================================================
+# Operating System
+# ============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================================================
+# Data & Artifacts (TrendLab-specific)
+# ============================================================================
+
+# Raw data files
+/data/raw/
+/data/downloads/
+/data/tmp/
+
+# Parquet cache (large files, can be regenerated)
+/data/cache/
+/data/parquet/
+
+# Keep canonical data structure but ignore contents
+/data/**/*.parquet
+/data/**/*.csv
+/data/**/*.feather
+
+# Backtest artifacts
+/artifacts/
+/output/
+/results/
+
+# Leaderboards and session data
+/leaderboards/
+/sessions/
+
+# ============================================================================
+# TrendLab Cache & Runtime
+# ============================================================================
+
+# Feature cache
+.cache/
+/cache/
+
+# Indicator cache
+/indicators_cache/
+
+# Result cache
+/result_cache/
+
+# ============================================================================
+# Claude Code / Agent Memory
+# ============================================================================
+
+# Claude Code memory (keep structure, ignore content)
+.claude/memory/*.md
+!.claude/memory/MEMORY.md
+
+# Claude Code plans (optional: uncomment to ignore)
+# .claude/plans/
+
+# ============================================================================
+# Logs & Debugging
+# ============================================================================
+
+# Log files
+*.log
+logs/
+*.out
+
+# Core dumps
+core
+core.*
+
+# Profiling data
+*.prof
+perf.data*
+flamegraph*.svg
+
+# ============================================================================
+# Testing & Benchmarking
+# ============================================================================
+
+# Criterion benchmark outputs
+/target/criterion/
+criterion-*.json
+
+# Coverage reports
+/target/coverage/
+lcov.info
+*.profraw
+*.profdata
+
+# Test outputs
+/test_output/
+/test_results/
+
+# ============================================================================
+# Documentation (generated)
+# ============================================================================
+
+# mdBook output
+/book/
+
+# Rustdoc output (already in target/)
+# /target/doc/
+
+# ============================================================================
+# Temporary Files
+# ============================================================================
+
+# Temporary build files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# Swap files
+*.swp
+*.swo
+
+# ============================================================================
+# Python (if using Python for data preprocessing)
+# ============================================================================
+
+# Python virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# ============================================================================
+# Environment & Secrets
+# ============================================================================
+
+# Environment files (API keys, credentials)
+.env
+.env.local
+.env.*.local
+
+# Secrets
+secrets/
+credentials/
+*.key
+*.pem
+
+# ============================================================================
+# Backup Files
+# ============================================================================
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# ============================================================================
+# Package Managers (if using additional tools)
+# ============================================================================
+
+# npm (if using JS tools)
+node_modules/
+package-lock.json
+
+# yarn
+yarn.lock
+.yarn/
+.pnp.*
+
+# ============================================================================
+# Keep These Files (Exceptions)
+# ============================================================================
+
+# Keep empty directories with .gitkeep
+!.gitkeep
+
+# Keep example data files (small, for testing)
+!data/examples/**
+
+# Keep golden test data
+!tests/golden/**
+
+# Keep README files
+!**/README.md
