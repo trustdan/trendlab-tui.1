@@ -134,6 +134,7 @@ mod tests {
                 timestamp: Utc::now(),
                 duration_secs: 1.0,
                 custom: HashMap::new(),
+                config: None,
             },
         }
     }

@@ -9,7 +9,11 @@
       "Bash(findstr:*)",
       "Bash(for f in mod.rs intent.rs manager.rs ratchet.rs strategies/mod.rs strategies/*.rs)",
       "Bash(do sed -i '/^\\\\/\\\\/\\\\//{ N; s/\\\\/\\\\/\\\\/.*\\\\n$/&/; }' \"$f\")",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(cargo bench:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)",
+      "Bash(Select-String \"test result:|FAILED|error\\\\[\")"
     ]
   }
 }

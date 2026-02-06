@@ -8,3 +8,6 @@ trendlab-core = { path = "../trendlab-core" }
 trendlab-runner = { path = "../trendlab-runner" }
 ratatui.workspace = true
 crossterm.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

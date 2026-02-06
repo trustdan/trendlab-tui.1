@@ -32,14 +32,14 @@ pub struct BacktestResult {
 }
 
 /// Single point in the equity curve.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EquityPoint {
     pub date: NaiveDate,
     pub equity: f64,
 }
 
 /// Trade record (simplified from trendlab-core's FilledOrder).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TradeRecord {
     pub symbol: String,
     pub entry_date: NaiveDate,
@@ -50,6 +50,27 @@ pub struct TradeRecord {
     pub quantity: i64,
     pub pnl: f64,
     pub return_pct: f64,
+    /// Signal that triggered this trade (e.g. "Long", "Short")
+    #[serde(default)]
+    pub signal_intent: Option<String>,
+    /// Order type used (e.g. "Market(MOO)", "StopMarket(99.5)")
+    #[serde(default)]
+    pub order_type: Option<String>,
+    /// Fill context (e.g. "Filled at open $105.23")
+    #[serde(default)]
+    pub fill_context: Option<String>,
+    /// Entry slippage in dollars (from FillResult)
+    #[serde(default)]
+    pub entry_slippage: Option<f64>,
+    /// Exit slippage in dollars (from FillResult)
+    #[serde(default)]
+    pub exit_slippage: Option<f64>,
+    /// Whether entry fill was gapped through (from FillResult)
+    #[serde(default)]
+    pub entry_was_gapped: Option<bool>,
+    /// Whether exit fill was gapped through (from FillResult)
+    #[serde(default)]
+    pub exit_was_gapped: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +275,10 @@ pub struct ResultMetadata {
 
     /// Additional custom metadata
     pub custom: HashMap<String, serde_json::Value>,
+
+    /// The config that produced this result (for reruns and manifest viewing)
+    #[serde(default)]
+    pub config: Option<crate::config::RunConfig>,
 }
 
 // Helper functions for statistics
@@ -392,6 +417,13 @@ mod tests {
             quantity: 100,
             pnl: 3000.0,
             return_pct: 10.0,
+            signal_intent: Some("Long".to_string()),
+            order_type: Some("Market(MOO)".to_string()),
+            fill_context: Some("Filled at open $300.00".to_string()),
+            entry_slippage: Some(0.15),
+            exit_slippage: Some(0.10),
+            entry_was_gapped: Some(false),
+            exit_was_gapped: Some(false),
         }];
 
         let stats = PerformanceStats::from_results(&equity_curve, &trades, 100_000.0);

@@ -125,7 +125,7 @@ impl Leaderboard {
             let mut sorted_scores = scores.clone();
             sorted_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mid = sorted_scores.len() / 2;
-            if sorted_scores.len() % 2 == 0 {
+            if sorted_scores.len().is_multiple_of(2) {
                 (sorted_scores[mid - 1] + sorted_scores[mid]) / 2.0
             } else {
                 sorted_scores[mid]
@@ -233,6 +233,7 @@ mod tests {
                 timestamp: Utc::now(),
                 duration_secs: 1.0,
                 custom: HashMap::new(),
+                config: None,
             },
         }
     }

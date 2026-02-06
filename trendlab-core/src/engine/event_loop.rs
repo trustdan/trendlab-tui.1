@@ -1,5 +1,6 @@
 use crate::domain::{Bar, Portfolio};
 use crate::engine::{EquityTracker, WarmupState};
+use crate::order_policy::guards::{Guard, RejectedIntent};
 use std::collections::HashMap;
 
 /// Main backtest engine
@@ -8,6 +9,12 @@ pub struct Engine {
     accounting: EquityTracker,
     portfolio: Portfolio,
     current_bar_index: usize,
+    /// Intrabar path policy name (e.g. "WorstCase", "BestCase", "OhlcOrder")
+    intrabar_policy: String,
+    /// Rejection guards evaluated per bar
+    guards: Vec<Box<dyn Guard>>,
+    /// Accumulated rejected intents across the run
+    rejected_intents: Vec<RejectedIntent>,
 }
 
 impl Engine {
@@ -17,6 +24,61 @@ impl Engine {
             accounting: EquityTracker::new(initial_cash),
             portfolio: Portfolio::new(initial_cash),
             current_bar_index: 0,
+            intrabar_policy: "WorstCase".to_string(),
+            guards: Vec::new(),
+            rejected_intents: Vec::new(),
+        }
+    }
+
+    /// Create an engine with rejection guards.
+    pub fn with_guards(
+        initial_cash: f64,
+        warmup_bars: usize,
+        guards: Vec<Box<dyn Guard>>,
+    ) -> Self {
+        Self {
+            warmup: WarmupState::new(warmup_bars),
+            accounting: EquityTracker::new(initial_cash),
+            portfolio: Portfolio::new(initial_cash),
+            current_bar_index: 0,
+            intrabar_policy: "WorstCase".to_string(),
+            guards,
+            rejected_intents: Vec::new(),
+        }
+    }
+
+    /// Create an engine with a specific intrabar path policy.
+    pub fn with_policy(
+        initial_cash: f64,
+        warmup_bars: usize,
+        policy: &str,
+    ) -> Self {
+        Self {
+            warmup: WarmupState::new(warmup_bars),
+            accounting: EquityTracker::new(initial_cash),
+            portfolio: Portfolio::new(initial_cash),
+            current_bar_index: 0,
+            intrabar_policy: policy.to_string(),
+            guards: Vec::new(),
+            rejected_intents: Vec::new(),
+        }
+    }
+
+    /// Create an engine with both guards and a path policy.
+    pub fn with_guards_and_policy(
+        initial_cash: f64,
+        warmup_bars: usize,
+        guards: Vec<Box<dyn Guard>>,
+        policy: &str,
+    ) -> Self {
+        Self {
+            warmup: WarmupState::new(warmup_bars),
+            accounting: EquityTracker::new(initial_cash),
+            portfolio: Portfolio::new(initial_cash),
+            current_bar_index: 0,
+            intrabar_policy: policy.to_string(),
+            guards,
+            rejected_intents: Vec::new(),
         }
     }
 
@@ -45,20 +107,38 @@ impl Engine {
 
     fn intrabar(&mut self, _bar: &Bar) {
         // Simulate triggers/fills using PathPolicy (M5)
+        // The intrabar_policy field selects the fill ordering:
+        // - "WorstCase": adverse fill ordering (stop-loss before take-profit)
+        // - "BestCase": favorable fill ordering
+        // - "OhlcOrder": follow O→H→L→C or O→L→H→C based on bar direction
+        let _ = &self.intrabar_policy;
     }
 
     fn end_of_bar(&mut self, _bar: &Bar) {
         // Fill MOC orders (M5)
     }
 
-    fn post_bar(&mut self, _bar: &Bar, current_prices: &HashMap<String, f64>) {
+    fn post_bar(&mut self, bar: &Bar, current_prices: &HashMap<String, f64>) {
         // Mark to market
         let equity = self.accounting.compute_equity(&self.portfolio.positions, current_prices);
         self.accounting.record_equity(equity);
 
-        // PM emits maintenance orders for NEXT bar (M6)
-        // Only if warmup complete
+        // Evaluate rejection guards (only after warmup)
         if self.warmup.is_warm() {
+            let cash = self.accounting.cash();
+            let open_positions = self.portfolio.positions.len();
+
+            for guard in &self.guards {
+                if let Some(rejection) = guard.evaluate(
+                    bar,
+                    self.current_bar_index,
+                    cash,
+                    open_positions,
+                ) {
+                    self.rejected_intents.push(rejection);
+                }
+            }
+
             // PM logic goes here in M6
         }
     }
@@ -82,12 +162,23 @@ impl Engine {
     pub fn portfolio(&self) -> &Portfolio {
         &self.portfolio
     }
+
+    /// Get all rejected intents accumulated during the run.
+    pub fn rejected_intents(&self) -> &[RejectedIntent] {
+        &self.rejected_intents
+    }
+
+    /// Get the intrabar policy name.
+    pub fn intrabar_policy(&self) -> &str {
+        &self.intrabar_policy
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::Bar;
+    use crate::order_policy::guards::{default_guards, RejectionReason};
     use chrono::Utc;
 
     #[test]
@@ -205,5 +296,66 @@ mod tests {
         // Verify state updated
         assert_eq!(engine.current_bar_index(), 1);
         assert_eq!(engine.equity_history().len(), 2); // initial + 1 bar
+    }
+
+    #[test]
+    fn test_guards_produce_rejections() {
+        let guards = default_guards();
+        let mut engine = Engine::with_guards(10000.0, 0, guards);
+
+        // Bar with very high volatility (range = 20/100 = 0.20 > 0.05 threshold)
+        // but normal volume (above 100k min)
+        let bar = Bar {
+            timestamp: Utc::now(),
+            symbol: "SPY".into(),
+            open: 100.0,
+            high: 110.0,
+            low: 90.0,
+            close: 100.0,
+            volume: 1_000_000.0,
+        };
+
+        let mut prices = HashMap::new();
+        prices.insert("SPY".to_string(), bar.close);
+        engine.process_bar(&bar, &prices);
+
+        // VolatilityGuard should fire (range 0.20 > 0.05)
+        let rejections = engine.rejected_intents();
+        assert!(!rejections.is_empty());
+        assert!(rejections.iter().any(|r| r.reason == RejectionReason::VolatilityGuard));
+    }
+
+    #[test]
+    fn test_no_rejections_during_warmup() {
+        let guards = default_guards();
+        let mut engine = Engine::with_guards(10000.0, 5, guards);
+
+        // Volatile bar during warmup
+        let bar = Bar {
+            timestamp: Utc::now(),
+            symbol: "SPY".into(),
+            open: 100.0,
+            high: 120.0,
+            low: 80.0,
+            close: 100.0,
+            volume: 1_000_000.0,
+        };
+
+        let mut prices = HashMap::new();
+        prices.insert("SPY".to_string(), bar.close);
+
+        // Process during warmup (bars 0-4)
+        for _ in 0..3 {
+            engine.process_bar(&bar, &prices);
+        }
+
+        // No rejections during warmup
+        assert!(engine.rejected_intents().is_empty());
+    }
+
+    #[test]
+    fn test_with_policy_constructor() {
+        let engine = Engine::with_policy(10000.0, 0, "BestCase");
+        assert_eq!(engine.intrabar_policy(), "BestCase");
     }
 }

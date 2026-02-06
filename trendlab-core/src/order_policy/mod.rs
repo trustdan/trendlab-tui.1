@@ -14,6 +14,7 @@
 //! 2. Testing signal families with their "natural" order types
 //! 3. Explicit control over execution realism
 
+pub mod guards;
 pub mod natural;
 pub mod immediate;
 

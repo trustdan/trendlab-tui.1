@@ -10,11 +10,15 @@
 //! - `ParamSweep`: Grid/random search over parameter ranges with parallelization
 //! - `Leaderboard`: Ranks strategies by fitness metrics
 //! - `Cache`: Parquet-based caching with hash-based deduplication
+//! - `Robustness`: Multi-level validation ladder with stability scoring
 
 pub mod cache;
 pub mod config;
 pub mod leaderboard;
+pub mod profiling;
+pub mod reporting;
 pub mod result;
+pub mod robustness;
 pub mod runner;
 pub mod sweep;
 
@@ -25,5 +29,11 @@ pub use config::{
 };
 pub use leaderboard::{FitnessMetric, Leaderboard};
 pub use result::BacktestResult;
+pub use robustness::{
+    ladder::{LevelResult, RobustnessLadder, RobustnessLevel},
+    levels::{CheapPass, CostDistribution, ExecutionMC, WalkForward},
+    promotion::{PromotionCriteria, PromotionFilter},
+    stability::{MetricDistribution, StabilityScore},
+};
 pub use runner::Runner;
 pub use sweep::{ParamGrid, ParamSweep};
