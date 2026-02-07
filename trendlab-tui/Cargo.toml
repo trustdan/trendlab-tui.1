@@ -1,13 +1,12 @@
 [package]
 name = "trendlab-tui"
+description = "Ratatui six-panel terminal UI with vim-style navigation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 trendlab-core = { path = "../trendlab-core" }
 trendlab-runner = { path = "../trendlab-runner" }
-ratatui.workspace = true
-crossterm.workspace = true
-chrono.workspace = true
-anyhow.workspace = true
-serde_json.workspace = true
+anyhow = { workspace = true }

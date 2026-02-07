@@ -42,13 +42,13 @@
   },
   "context": {
     "include": [
-      "src/**/*.rs",
-      "crates/**/src/**/*.rs",
+      "trendlab-*/src/**/*.rs",
+      "trendlab-*/Cargo.toml",
       "Cargo.toml",
       "Cargo.lock",
       "README.md",
       ".cargo/config.toml",
-      "docs/**/*.md"
+      "config/**/*.toml"
     ],
     "exclude": [
       "target/**",

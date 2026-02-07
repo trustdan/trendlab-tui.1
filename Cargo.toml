@@ -1,25 +1,40 @@
 [workspace]
+resolver = "2"
 members = [
     "trendlab-core",
     "trendlab-runner",
     "trendlab-tui",
     "trendlab-cli",
 ]
-resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["TrendLab Contributors"]
+rust-version = "1.75"
 license = "MIT"
 
 [workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Date/time
 chrono = { version = "0.4", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-anyhow = "1.0"
-polars = { version = "0.44", features = ["lazy", "parquet"] }
-ratatui = "0.28"
-crossterm = "0.28"
-blake3 = "1.5"  # Stable deterministic hashing for RunId/DatasetHash
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Hashing
+blake3 = "1"
+
+# RNG
+rand = "0.8"
+
+# Testing
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

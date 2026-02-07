@@ -13,13 +13,13 @@ This project exists to solve two chronic backtesting failure modes:
 
 The core redesign is a strict, composable, event-driven pipeline.
 
-## Project Status & Initialization
+## Project Status
 
-**Current Phase:** Pre-M0 (Repository scaffold not yet created)
+**Current Phase:** Phase 1 — Repo Bootstrap
 
-The project is in **planning phase**. See [trendlab-v3-development-roadmap-bdd-v2.md](trendlab-v3-development-roadmap-bdd-v2.md) for the full 12-milestone BDD-driven development plan.
+See [trendlab-v4-new-build-plan.md](trendlab-v4-new-build-plan.md) for the full development plan (Phases 1–14, with Phase 10 split into 10a/10b/10c, ~20–22 weeks solo).
 
-### Expected Workspace Structure (M0 deliverable)
+### Workspace Structure (Phase 1 deliverable)
 
 ```text
 trendlab-v3/
@@ -27,11 +27,11 @@ trendlab-v3/
 ├── trendlab-core/              # engine (domain, signals, execution, PM)
 ├── trendlab-runner/            # sweeps, caching, leaderboards
 ├── trendlab-tui/               # Ratatui interface
-├── trendlab-cli/               # optional CLI wrapper
+├── trendlab-cli/               # CLI wrapper
 └── data/                       # canonical Parquet cache
 ```
 
-### Once Initialized: Common Commands
+### Common Commands
 
 ```bash
 # Build all workspace members
@@ -50,11 +50,8 @@ cargo test test_name -- --nocaptures
 cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
 
-# Run benchmarks (Criterion, added in M12)
+# Run benchmarks (Criterion, added in Phase 14)
 cargo bench -p trendlab-core
-
-# BDD tests (Cucumber, used throughout development)
-cargo test --test bdd_*
 ```
 
 ## Non-Negotiable Architecture Invariants
@@ -81,7 +78,25 @@ Per bar:
 3. **End-of-bar:** fill MOC orders
 4. **Post-bar:** update portfolio, then let position manager emit maintenance orders for next bar
 
-### C) "Promotion Ladder" for realism vs speed
+**Void bar policy:** When a symbol has a NaN/missing bar, the market status is `Closed` for that symbol. Equity carries forward, pending orders are not checked, PM increments time counters but emits no price-dependent intents, and indicators/signals are not evaluated.
+
+### C) Decision / Placement / Fill Timeline
+
+Signals evaluated at bar T's close may only use data up to and including bar T. Orders generated from those signals execute on bar T+1 (next-bar-open by default). No order may execute on the same bar whose data generated the signal, unless using explicit intrabar logic (deferred).
+
+### D) Look-Ahead Contamination Guard
+
+No indicator value at bar t may depend on price data from bar t+1 or later. Every indicator and signal must have a look-ahead contamination test: compute on a truncated series (bars 1–100) and on the full series (bars 1–200), assert bars 1–100 are identical. This is mandatory and must pass before any phase gate.
+
+### E) NaN Propagation Guard
+
+Invalid or NaN input must never generate a trade. If a bar contains NaN in any OHLCV field, indicators produce NaN, signals produce no event, and the event loop skips order checks for that symbol on that bar. The invalid-bar rate is tracked per-run and flagged if >10% for any symbol.
+
+### F) Deterministic RNG Hierarchy
+
+A master seed generates deterministic sub-seeds for each (run_id, symbol, iteration) tuple. Sub-seeds are derived independently of thread scheduling order. Results must be identical regardless of thread count. Verified by running YOLO with 1 thread and 8 threads and asserting identical outputs.
+
+### G) "Promotion Ladder" for realism vs speed
 
 Cheap candidates must "earn" expensive simulation.
 
@@ -117,8 +132,11 @@ Cheap candidates must "earn" expensive simulation.
 ### Testing expectations
 
 - Unit tests for each module (signals/orders/execution/portfolio/pm)
-- Property tests for invariants (no double fill, OCO consistency, equity accounting)
+- Property tests for invariants (no double fill, OCO consistency, equity accounting, ratchet monotonicity)
+- Look-ahead contamination tests for every indicator and signal (truncated vs full series)
+- NaN injection tests for every indicator and signal (NaN input → no trade)
 - Golden regression tests for stable benchmarks
+- All core domain types must be `Send + Sync`
 
 ## TUI Theme & Progress Bars
 

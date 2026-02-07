@@ -1,127 +1,154 @@
+//! Deterministic ID types using BLAKE3.
+//!
+//! - `ConfigHash`: structural identity (component types only, no parameter values).
+//! - `FullHash`: exact identity (component types + all parameter values).
+//! - `DatasetHash`: identifies a specific dataset (symbols + date range + data content).
+//! - `RunId`: unique identifier for a single backtest run.
+//! - `OrderId`, `SignalEventId`, `OcoGroupId`: sequential counters.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Deterministic configuration ID (hash of strategy + params + execution config)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ConfigId(pub String);
+// ── Sequential ID types ──────────────────────────────────────────────
 
-impl ConfigId {
-    pub fn from_hash(hash: &str) -> Self {
-        Self(hash.to_string())
+macro_rules! seq_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub struct $name(pub u64);
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({})", stringify!($name), self.0)
+            }
+        }
+    };
+}
+
+seq_id!(OrderId);
+seq_id!(SignalEventId);
+seq_id!(OcoGroupId);
+
+/// Monotonically increasing ID generator.
+#[derive(Debug, Default)]
+pub struct IdGen {
+    next: u64,
+}
+
+impl IdGen {
+    pub fn next_order_id(&mut self) -> OrderId {
+        let id = OrderId(self.next);
+        self.next += 1;
+        id
+    }
+
+    pub fn next_signal_event_id(&mut self) -> SignalEventId {
+        let id = SignalEventId(self.next);
+        self.next += 1;
+        id
+    }
+
+    pub fn next_oco_group_id(&mut self) -> OcoGroupId {
+        let id = OcoGroupId(self.next);
+        self.next += 1;
+        id
     }
 }
 
-impl fmt::Display for ConfigId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+// ── BLAKE3-based hash types ──────────────────────────────────────────
+
+/// 32-byte BLAKE3 hash wrapper with hex display and serde as hex string.
+macro_rules! hash_id {
+    ($name:ident) => {
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        pub struct $name(pub [u8; 32]);
+
+        impl $name {
+            pub fn from_bytes(data: &[u8]) -> Self {
+                Self(*blake3::hash(data).as_bytes())
+            }
+
+            pub fn as_hex(&self) -> String {
+                self.0.iter().map(|b| format!("{b:02x}")).collect()
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}({})", stringify!($name), &self.as_hex()[..16])
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.as_hex())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(&self.as_hex())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let hex = String::deserialize(d)?;
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                    .collect::<Result<_, _>>()
+                    .map_err(serde::de::Error::custom)?;
+                let arr: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| serde::de::Error::custom("expected 32 bytes"))?;
+                Ok(Self(arr))
+            }
+        }
+    };
 }
 
-/// Deterministic dataset hash (content hash of canonicalized data)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DatasetHash(pub String);
-
-impl DatasetHash {
-    pub fn from_hash(hash: &str) -> Self {
-        Self(hash.to_string())
-    }
-}
-
-impl fmt::Display for DatasetHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Deterministic run ID (config + dataset + seed)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RunId {
-    pub config_id: ConfigId,
-    pub dataset_hash: DatasetHash,
-    pub seed: u64,
-}
-
-impl RunId {
-    pub fn new(config_id: ConfigId, dataset_hash: DatasetHash, seed: u64) -> Self {
-        Self { config_id, dataset_hash, seed }
-    }
-
-    /// Generate deterministic run hash
-    /// Uses BLAKE3 for stable, collision-resistant hashing across builds/platforms
-    pub fn hash(&self) -> String {
-        use serde_json::json;
-
-        // Canonical serialization (sorted keys)
-        let canonical = json!({
-            "config_id": &self.config_id.0,
-            "dataset_hash": &self.dataset_hash.0,
-            "seed": self.seed,
-        });
-
-        // Use BLAKE3 for stable deterministic hash
-        // Alternative: xxhash64 if BLAKE3 dep is too heavy
-        let hash_bytes = blake3::hash(canonical.to_string().as_bytes());
-        hash_bytes.to_hex().to_string()
-    }
-}
-
-impl fmt::Display for RunId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.config_id, self.dataset_hash, self.seed)
-    }
-}
-
-/// Order ID
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct OrderId(pub String);
-
-impl OrderId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
-
-impl From<u64> for OrderId {
-    fn from(id: u64) -> Self {
-        Self(id.to_string())
-    }
-}
-
-/// Fill ID
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FillId(pub String);
-
-impl FillId {
-    pub fn new(id: String) -> Self {
-        Self(id)
-    }
-}
-
-/// Trade ID
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TradeId(pub String);
-
-impl TradeId {
-    pub fn new(id: String) -> Self {
-        Self(id)
-    }
-}
+hash_id!(ConfigHash);
+hash_id!(FullHash);
+hash_id!(DatasetHash);
+hash_id!(RunId);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_run_id_deterministic() {
-        let run1 = RunId::new(ConfigId::from_hash("abc123"), DatasetHash::from_hash("def456"), 42);
-        let run2 = RunId::new(ConfigId::from_hash("abc123"), DatasetHash::from_hash("def456"), 42);
-        assert_eq!(run1.hash(), run2.hash());
+    fn id_gen_is_monotonic() {
+        let mut gen = IdGen::default();
+        let a = gen.next_order_id();
+        let b = gen.next_order_id();
+        assert!(b.0 > a.0);
     }
 
     #[test]
-    fn test_run_id_different_seed_different_hash() {
-        let run1 = RunId::new(ConfigId::from_hash("abc123"), DatasetHash::from_hash("def456"), 42);
-        let run2 = RunId::new(ConfigId::from_hash("abc123"), DatasetHash::from_hash("def456"), 43);
-        assert_ne!(run1.hash(), run2.hash());
+    fn blake3_hash_is_deterministic() {
+        let h1 = ConfigHash::from_bytes(b"donchian+atr_trail+worst_case+no_filter");
+        let h2 = ConfigHash::from_bytes(b"donchian+atr_trail+worst_case+no_filter");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn different_input_different_hash() {
+        let h1 = ConfigHash::from_bytes(b"donchian+atr_trail");
+        let h2 = ConfigHash::from_bytes(b"donchian+chandelier");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_serialization_roundtrip() {
+        let h = ConfigHash::from_bytes(b"test data");
+        let json = serde_json::to_string(&h).unwrap();
+        let deser: ConfigHash = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, deser);
+    }
+
+    #[test]
+    fn hash_hex_is_64_chars() {
+        let h = RunId::from_bytes(b"run-1");
+        assert_eq!(h.as_hex().len(), 64);
     }
 }

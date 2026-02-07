@@ -1,10 +1,12 @@
 [package]
 name = "trendlab-cli"
+description = "CLI: download and run commands"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 trendlab-core = { path = "../trendlab-core" }
 trendlab-runner = { path = "../trendlab-runner" }
-clap = { version = "4.0", features = ["derive"] }
-anyhow.workspace = true
+anyhow = { workspace = true }

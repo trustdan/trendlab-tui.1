@@ -1,2 +1,1 @@
-# Deny warnings in CI
-warn-on-all-wildcard-imports = true
+msrv = "1.75"
