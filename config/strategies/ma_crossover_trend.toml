@@ -1,0 +1,30 @@
+[backtest]
+symbol = "SPY"
+start_date = "2020-01-02"
+end_date = "2024-12-31"
+initial_capital = 100000.0
+trading_mode = "long_short"
+
+[signal]
+type = "ma_crossover"
+[signal.params]
+fast_period = 10.0
+slow_period = 50.0
+ma_type = 0.0
+
+[position_manager]
+type = "chandelier"
+[position_manager.params]
+atr_period = 22.0
+multiplier = 3.0
+
+[execution_model]
+type = "next_bar_open"
+[execution_model.params]
+preset = 1.0
+
+[signal_filter]
+type = "ma_regime"
+[signal_filter.params]
+period = 200.0
+direction = 0.0

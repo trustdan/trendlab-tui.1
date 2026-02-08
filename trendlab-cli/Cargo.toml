@@ -10,3 +10,6 @@ license.workspace = true
 trendlab-core = { path = "../trendlab-core" }
 trendlab-runner = { path = "../trendlab-runner" }
 anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }

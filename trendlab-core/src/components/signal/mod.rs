@@ -4,6 +4,17 @@
 //! never portfolio or position state. Signal events are immutable once emitted —
 //! they describe a market event, not a downstream decision.
 
+pub mod aroon;
+pub mod bollinger;
+pub mod breakout_52w;
+pub mod donchian;
+pub mod keltner;
+pub mod ma_crossover;
+pub mod parabolic_sar;
+pub mod roc_momentum;
+pub mod supertrend;
+pub mod tsmom;
+
 use crate::domain::{Bar, SignalEventId};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -90,6 +101,41 @@ impl FilterVerdict {
     }
 }
 
+/// Null signal — always returns None. Used as a stub in tests that
+/// don't need real signal generation.
+pub struct NullSignal;
+
+impl SignalGenerator for NullSignal {
+    fn name(&self) -> &str {
+        "null"
+    }
+
+    fn warmup_bars(&self) -> usize {
+        0
+    }
+
+    fn evaluate(
+        &self,
+        _bars: &[Bar],
+        _bar_index: usize,
+        _indicators: &IndicatorValues,
+    ) -> Option<SignalEvent> {
+        None
+    }
+}
+
+// Re-export concrete signal types.
+pub use aroon::AroonCrossover;
+pub use bollinger::BollingerBreakout;
+pub use breakout_52w::Breakout52w;
+pub use donchian::DonchianBreakout;
+pub use keltner::KeltnerBreakout;
+pub use ma_crossover::{MaCrossover, MaType};
+pub use parabolic_sar::ParabolicSarSignal;
+pub use roc_momentum::RocMomentum;
+pub use supertrend::SupertrendSignal;
+pub use tsmom::Tsmom;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +186,15 @@ mod tests {
         assert!(FilterVerdict::Passed.is_passed());
         assert!(!FilterVerdict::FilteredByAdx.is_passed());
         assert!(!FilterVerdict::FilteredByCustom("test".into()).is_passed());
+    }
+
+    #[test]
+    fn null_signal_returns_none() {
+        let sig = NullSignal;
+        let bars = vec![];
+        let iv = IndicatorValues::new();
+        assert!(sig.evaluate(&bars, 0, &iv).is_none());
+        assert_eq!(sig.name(), "null");
+        assert_eq!(sig.warmup_bars(), 0);
     }
 }

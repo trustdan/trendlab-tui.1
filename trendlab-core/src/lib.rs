@@ -10,8 +10,11 @@
 //! - Four-component composition model (signal + PM + execution + filter)
 
 pub mod components;
+pub mod data;
 pub mod domain;
+pub mod engine;
 pub mod fingerprint;
+pub mod indicators;
 pub mod rng;
 pub mod schema;
 pub mod smoke;
@@ -80,6 +83,70 @@ mod tests {
         // RNG
         require_send::<rng::RngHierarchy>();
         require_sync::<rng::RngHierarchy>();
+
+        // Engine types
+        require_send::<engine::EngineConfig>();
+        require_sync::<engine::EngineConfig>();
+        require_send::<engine::RunResult>();
+        require_sync::<engine::RunResult>();
+        require_send::<engine::OrderBook>();
+        require_sync::<engine::OrderBook>();
+
+        // Position manager concrete types
+        require_send::<components::AtrTrailing>();
+        require_sync::<components::AtrTrailing>();
+        require_send::<components::Chandelier>();
+        require_sync::<components::Chandelier>();
+        require_send::<components::PercentTrailing>();
+        require_sync::<components::PercentTrailing>();
+        require_send::<components::SinceEntryTrailing>();
+        require_sync::<components::SinceEntryTrailing>();
+        require_send::<components::FrozenReference>();
+        require_sync::<components::FrozenReference>();
+        require_send::<components::TimeDecay>();
+        require_sync::<components::TimeDecay>();
+        require_send::<components::MaxHoldingPeriod>();
+        require_sync::<components::MaxHoldingPeriod>();
+        require_send::<components::FixedStopLoss>();
+        require_sync::<components::FixedStopLoss>();
+        require_send::<components::BreakevenThenTrail>();
+        require_sync::<components::BreakevenThenTrail>();
+        require_send::<components::NoOpPm>();
+        require_sync::<components::NoOpPm>();
+
+        // Signal concrete types
+        require_send::<components::signal::Breakout52w>();
+        require_sync::<components::signal::Breakout52w>();
+        require_send::<components::signal::DonchianBreakout>();
+        require_sync::<components::signal::DonchianBreakout>();
+        require_send::<components::signal::BollingerBreakout>();
+        require_sync::<components::signal::BollingerBreakout>();
+        require_send::<components::signal::KeltnerBreakout>();
+        require_sync::<components::signal::KeltnerBreakout>();
+        require_send::<components::signal::SupertrendSignal>();
+        require_sync::<components::signal::SupertrendSignal>();
+        require_send::<components::signal::ParabolicSarSignal>();
+        require_sync::<components::signal::ParabolicSarSignal>();
+        require_send::<components::signal::MaCrossover>();
+        require_sync::<components::signal::MaCrossover>();
+        require_send::<components::signal::Tsmom>();
+        require_sync::<components::signal::Tsmom>();
+        require_send::<components::signal::RocMomentum>();
+        require_sync::<components::signal::RocMomentum>();
+        require_send::<components::signal::AroonCrossover>();
+        require_sync::<components::signal::AroonCrossover>();
+        require_send::<components::signal::NullSignal>();
+        require_sync::<components::signal::NullSignal>();
+
+        // Filter concrete types
+        require_send::<components::filter::NoFilter>();
+        require_sync::<components::filter::NoFilter>();
+        require_send::<components::filter::AdxFilter>();
+        require_sync::<components::filter::AdxFilter>();
+        require_send::<components::filter::MaRegimeFilter>();
+        require_sync::<components::filter::MaRegimeFilter>();
+        require_send::<components::filter::VolatilityFilter>();
+        require_sync::<components::filter::VolatilityFilter>();
     }
 
     /// Architecture contract: SignalGenerator trait does NOT accept Portfolio.

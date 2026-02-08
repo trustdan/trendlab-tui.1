@@ -3,6 +3,38 @@
 //! PMs operate after the post-bar mark-to-market step. They emit order intents
 //! (not direct fills) that apply to the NEXT bar. PMs must obey the ratchet
 //! invariant: stops may tighten but never loosen.
+//!
+//! ## Concrete implementations
+//!
+//! - [`AtrTrailing`] — ATR-based trailing stop
+//! - [`Chandelier`] — chandelier exit (ATR from highest high since entry)
+//! - [`PercentTrailing`] — fixed percentage trailing stop
+//! - [`SinceEntryTrailing`] — drawdown-from-peak condition exit
+//! - [`FrozenReference`] — stop frozen at entry price, never moves
+//! - [`TimeDecay`] — stop tightens over time
+//! - [`MaxHoldingPeriod`] — force exit after N bars
+//! - [`FixedStopLoss`] — simple fixed stop below entry
+//! - [`BreakevenThenTrail`] — move to breakeven, then trail
+
+pub mod atr_trailing;
+pub mod breakeven_then_trail;
+pub mod chandelier;
+pub mod fixed_stop_loss;
+pub mod frozen_reference;
+pub mod max_holding_period;
+pub mod percent_trailing;
+pub mod since_entry_trailing;
+pub mod time_decay;
+
+pub use atr_trailing::AtrTrailing;
+pub use breakeven_then_trail::BreakevenThenTrail;
+pub use chandelier::Chandelier;
+pub use fixed_stop_loss::FixedStopLoss;
+pub use frozen_reference::FrozenReference;
+pub use max_holding_period::MaxHoldingPeriod;
+pub use percent_trailing::PercentTrailing;
+pub use since_entry_trailing::SinceEntryTrailing;
+pub use time_decay::TimeDecay;
 
 use crate::domain::{Bar, MarketStatus, Position};
 
@@ -66,8 +98,8 @@ impl OrderIntent {
 /// # Architecture invariants
 /// - PMs operate after post-bar mark-to-market, emitting intents for the NEXT bar.
 /// - PMs must obey the ratchet invariant: stops may tighten but never loosen.
-/// - On void bars (`MarketStatus::Closed`), PMs may increment time-based counters
-///   but must NOT emit price-dependent order intents.
+/// - On void bars (`MarketStatus::Closed`), the engine does NOT call `on_bar`.
+///   Time-based counters (bars_held) are already incremented by `Position::tick_bar()`.
 /// - Time-based exits that expire during void bars emit on the next valid bar.
 pub trait PositionManager: Send + Sync {
     /// Human-readable name (e.g., "atr_trailing", "chandelier_exit").
@@ -78,9 +110,31 @@ pub trait PositionManager: Send + Sync {
         &self,
         position: &Position,
         bar: &Bar,
+        bar_index: usize,
         market_status: MarketStatus,
         indicators: &IndicatorValues,
     ) -> OrderIntent;
+}
+
+/// No-op position manager — always holds. Used as default in tests
+/// and for strategies that rely solely on signal-driven exits.
+pub struct NoOpPm;
+
+impl PositionManager for NoOpPm {
+    fn name(&self) -> &str {
+        "no_op"
+    }
+
+    fn on_bar(
+        &self,
+        _position: &Position,
+        _bar: &Bar,
+        _bar_index: usize,
+        _market_status: MarketStatus,
+        _indicators: &IndicatorValues,
+    ) -> OrderIntent {
+        OrderIntent::hold()
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +168,25 @@ mod tests {
         let deser: OrderIntent = serde_json::from_str(&json).unwrap();
         assert_eq!(intent.action, deser.action);
         assert_eq!(intent.stop_price, deser.stop_price);
+    }
+
+    #[test]
+    fn noop_pm_always_holds() {
+        use chrono::NaiveDate;
+        let pm = NoOpPm;
+        let pos = Position::new_long("SPY".into(), 100.0, 100.0, 0);
+        let bar = Bar {
+            symbol: "SPY".to_string(),
+            date: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            open: 100.0,
+            high: 105.0,
+            low: 98.0,
+            close: 103.0,
+            volume: 1000,
+            adj_close: 103.0,
+        };
+        let iv = IndicatorValues::new();
+        let intent = pm.on_bar(&pos, &bar, 0, MarketStatus::Open, &iv);
+        assert_eq!(intent.action, IntentAction::Hold);
     }
 }

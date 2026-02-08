@@ -69,19 +69,8 @@ $RECYCLE.BIN/
 # Data & Artifacts (TrendLab-specific)
 # ============================================================================
 
-# Raw data files
-/data/raw/
-/data/downloads/
-/data/tmp/
-
-# Parquet cache (large files, can be regenerated)
-/data/cache/
-/data/parquet/
-
-# Keep canonical data structure but ignore contents
-/data/**/*.parquet
-/data/**/*.csv
-/data/**/*.feather
+# Data cache (downloaded/generated, can be regenerated)
+/data/
 
 # Backtest artifacts
 /artifacts/

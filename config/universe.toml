@@ -1,0 +1,7 @@
+[sectors]
+Technology = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "AVGO", "CRM", "ADBE", "ORCL"]
+Healthcare = ["JNJ", "UNH", "PFE", "ABBV", "MRK", "LLY", "TMO", "ABT"]
+Finance = ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "C", "AXP", "V"]
+Energy = ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO"]
+Consumer = ["WMT", "PG", "KO", "PEP", "COST", "HD", "MCD", "NKE", "SBUX", "TGT"]
+ETFs = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV"]

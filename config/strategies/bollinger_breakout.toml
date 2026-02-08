@@ -1,0 +1,28 @@
+[backtest]
+symbol = "SPY"
+start_date = "2020-01-02"
+end_date = "2024-12-31"
+initial_capital = 100000.0
+trading_mode = "long_only"
+
+[signal]
+type = "bollinger_breakout"
+[signal.params]
+period = 20.0
+std_multiplier = 2.0
+
+[position_manager]
+type = "percent_trailing"
+[position_manager.params]
+trail_pct = 0.05
+
+[execution_model]
+type = "next_bar_open"
+[execution_model.params]
+preset = 1.0
+
+[signal_filter]
+type = "adx_filter"
+[signal_filter.params]
+period = 14.0
+threshold = 25.0

@@ -4,6 +4,11 @@
 //! the path policy for intrabar ambiguity, gap handling, and friction
 //! parameters (slippage, commission).
 
+pub mod close_on_signal;
+pub mod limit_entry;
+pub mod next_bar_open;
+pub mod stop_entry;
+
 use crate::domain::{Bar, Instrument, OrderType};
 
 use super::signal::SignalEvent;
@@ -115,6 +120,12 @@ impl ExecutionPreset {
         }
     }
 }
+
+// Re-export concrete models.
+pub use close_on_signal::CloseOnSignalModel;
+pub use limit_entry::LimitEntryModel;
+pub use next_bar_open::NextBarOpenModel;
+pub use stop_entry::StopEntryModel;
 
 #[cfg(test)]
 mod tests {

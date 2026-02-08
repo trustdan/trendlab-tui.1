@@ -14,7 +14,7 @@ pub mod trade;
 
 // Re-export the most commonly used types at the domain level.
 pub use bar::{Bar, MarketStatus};
-pub use fill::Fill;
+pub use fill::{Fill, FillPhase};
 pub use ids::{
     ConfigHash, DatasetHash, FullHash, IdGen, OcoGroupId, OrderId, RunId, SignalEventId,
 };

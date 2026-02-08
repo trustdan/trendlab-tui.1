@@ -1,0 +1,23 @@
+[backtest]
+symbol = "SPY"
+start_date = "2020-01-02"
+end_date = "2024-12-31"
+initial_capital = 100000.0
+trading_mode = "long_short"
+
+[signal]
+type = "supertrend"
+[signal.params]
+period = 10.0
+multiplier = 3.0
+
+[position_manager]
+type = "breakeven_then_trail"
+[position_manager.params]
+breakeven_trigger_pct = 0.02
+trail_pct = 0.03
+
+[execution_model]
+type = "next_bar_open"
+[execution_model.params]
+preset = 1.0

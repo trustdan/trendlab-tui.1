@@ -54,6 +54,10 @@ pub struct Order {
     pub parent_id: Option<OrderId>,
     /// OCO group this order belongs to.
     pub oco_group_id: Option<OcoGroupId>,
+    /// Bar index when this order was activated (bracket children only).
+    /// Used to prevent same-bar entry+exit: children activated during bar T
+    /// are not eligible for fill until bar T+1.
+    pub activated_bar: Option<usize>,
 }
 
 impl Order {
@@ -112,6 +116,7 @@ mod tests {
             created_bar: 0,
             parent_id: None,
             oco_group_id: None,
+            activated_bar: None,
         };
         assert_eq!(order.remaining_quantity(), 70.0);
     }
@@ -131,6 +136,7 @@ mod tests {
             created_bar: 0,
             parent_id: None,
             oco_group_id: None,
+            activated_bar: None,
         };
         assert!(order.is_active());
 
@@ -162,6 +168,7 @@ mod tests {
             created_bar: 5,
             parent_id: Some(OrderId(41)),
             oco_group_id: Some(OcoGroupId(10)),
+            activated_bar: None,
         };
         let json = serde_json::to_string(&order).unwrap();
         let deser: Order = serde_json::from_str(&json).unwrap();

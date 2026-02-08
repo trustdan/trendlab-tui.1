@@ -1,6 +1,6 @@
 {
   "name": "TrendLab",
-  "description": "TrendLab v3 \u2014 Rust backtesting research platform (TUI + realistic execution)",
+  "description": "TrendLab v3 — Rust backtesting research platform (TUI + realistic execution)",
   "version": "3.2.0",
   "commands": {
     "architecture": {
@@ -122,5 +122,10 @@
       "description": "Run manifests, artifacts, and reproducible reporting",
       "file": "agents/reporting-artifacts.md"
     }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cargo run:*)"
+    ]
   }
 }

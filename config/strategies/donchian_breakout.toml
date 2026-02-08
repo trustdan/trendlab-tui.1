@@ -1,0 +1,23 @@
+[backtest]
+symbol = "SPY"
+start_date = "2020-01-02"
+end_date = "2024-12-31"
+initial_capital = 100000.0
+trading_mode = "long_only"
+position_size_pct = 1.0
+
+[signal]
+type = "donchian_breakout"
+[signal.params]
+entry_lookback = 50.0
+
+[position_manager]
+type = "atr_trailing"
+[position_manager.params]
+atr_period = 14.0
+multiplier = 3.0
+
+[execution_model]
+type = "stop_entry"
+[execution_model.params]
+preset = 1.0

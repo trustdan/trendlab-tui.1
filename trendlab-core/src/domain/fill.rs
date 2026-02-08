@@ -5,6 +5,17 @@ use super::instrument::OrderSide;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+/// Which phase of the bar loop produced this fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FillPhase {
+    /// Phase 1: MOO and MarketImmediate fills.
+    StartOfBar,
+    /// Phase 2: stop/limit trigger fills.
+    Intrabar,
+    /// Phase 3: MOC fills.
+    EndOfBar,
+}
+
 /// Record of an order being filled (fully or partially).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Fill {
@@ -17,6 +28,8 @@ pub struct Fill {
     pub quantity: f64,
     pub commission: f64,
     pub slippage: f64,
+    /// Which bar-loop phase produced this fill.
+    pub phase: FillPhase,
 }
 
 impl Fill {
@@ -46,6 +59,7 @@ mod tests {
             quantity: 50.0,
             commission: 5.0,
             slippage: 2.0,
+            phase: FillPhase::StartOfBar,
         };
         // Buy: cost = 100*50 + 5 + 2 = 5007
         assert_eq!(fill.net_amount(), 5007.0);
@@ -63,6 +77,7 @@ mod tests {
             quantity: 50.0,
             commission: 5.0,
             slippage: 2.0,
+            phase: FillPhase::Intrabar,
         };
         // Sell: proceeds = 110*50 - 5 - 2 = 5493
         assert_eq!(fill.net_amount(), 5493.0);
