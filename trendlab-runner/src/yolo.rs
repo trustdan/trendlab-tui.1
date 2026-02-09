@@ -9,6 +9,7 @@
 //! - `structural_explore` (0.0–1.0): probability of trying novel component combos.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -18,13 +19,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use trendlab_core::components::sampler::{sample_composition, ComponentPool};
-use trendlab_core::domain::RunId;
-use trendlab_core::fingerprint::TradingMode;
+use trendlab_core::domain::{DatasetHash, RunId};
+use trendlab_core::fingerprint::{RunFingerprint, TradingMode};
 use trendlab_core::rng::RngHierarchy;
 
+use crate::cross_leaderboard::CrossSymbolLeaderboard;
 use crate::data_loader::LoadedData;
+use crate::fdr::FdrFamily;
 use crate::fitness::FitnessMetric;
+use crate::history::{HistoryEntry, WriteFilter, YoloHistory};
 use crate::leaderboard::{LeaderboardEntry, SymbolLeaderboard};
+use crate::promotion::{promote, PromotionConfig, PromotionLevel};
 use crate::runner::{decode_execution_preset, run_backtest_from_data, RunError};
 
 // ─── Config types ────────────────────────────────────────────────────
@@ -60,8 +65,9 @@ pub struct YoloConfig {
     pub position_size_pct: f64,
     pub trading_mode: TradingMode,
 
-    // ── Robustness (Phase 11 stub) ──
-    pub wf_sharpe_threshold: f64,
+    // ── Robustness (Phase 11) ──
+    /// Promotion ladder configuration. If None, promotion is disabled.
+    pub promotion_config: Option<PromotionConfig>,
 
     // ── Sweep settings ──
     pub sweep_depth: SweepDepth,
@@ -79,6 +85,14 @@ pub struct YoloConfig {
     // ── Fitness & seeding ──
     pub fitness_metric: FitnessMetric,
     pub master_seed: u64,
+
+    // ── Cross-symbol & history (Phase 10c) ──
+    /// Path to JSONL history file. If None, history is disabled.
+    pub history_path: Option<PathBuf>,
+    /// Write filter for history persistence.
+    pub write_filter: WriteFilter,
+    /// Catastrophic loss threshold for cross-symbol flagging (e.g., -0.5 = -50%).
+    pub catastrophic_threshold: f64,
 }
 
 impl Default for YoloConfig {
@@ -91,7 +105,7 @@ impl Default for YoloConfig {
             initial_capital: 100_000.0,
             position_size_pct: 1.0,
             trading_mode: TradingMode::LongOnly,
-            wf_sharpe_threshold: 0.5,
+            promotion_config: None,
             sweep_depth: SweepDepth::Normal,
             warmup_iterations: 10,
             combo_mode: ComboMode::None,
@@ -101,6 +115,9 @@ impl Default for YoloConfig {
             leaderboard_max_size: 500,
             fitness_metric: FitnessMetric::Sharpe,
             master_seed: 42,
+            history_path: None,
+            write_filter: WriteFilter::default(),
+            catastrophic_threshold: -0.5,
         }
     }
 }
@@ -133,15 +150,26 @@ pub struct YoloProgress {
     pub throughput_per_min: f64,
     pub leaderboard_entries: usize,
     pub elapsed_secs: f64,
+    pub cross_leaderboard_entries: usize,
+    pub history_file_size_mb: f64,
+    pub promoted_l2_count: usize,
+    pub promoted_l3_count: usize,
+    pub fdr_family_size: usize,
 }
 
 /// Final result of a YOLO run.
 pub struct YoloResult {
     pub leaderboards: HashMap<String, SymbolLeaderboard>,
+    pub cross_leaderboard: CrossSymbolLeaderboard,
     pub iterations_completed: usize,
     pub success_count: usize,
     pub error_count: usize,
     pub elapsed_secs: f64,
+    pub history_entries_written: usize,
+    pub history_file_size_bytes: u64,
+    pub promoted_l2_count: usize,
+    pub promoted_l3_count: usize,
+    pub fdr_family_size: usize,
 }
 
 /// Errors from the YOLO engine.
@@ -210,6 +238,22 @@ pub fn run_yolo(
             )
         })
         .collect();
+
+    // Initialize cross-symbol leaderboard
+    let mut cross_leaderboard =
+        CrossSymbolLeaderboard::new(config.leaderboard_max_size, config.catastrophic_threshold);
+
+    // Initialize history if path is configured
+    let history = config
+        .history_path
+        .as_ref()
+        .map(|p| YoloHistory::new(p.clone(), config.write_filter.clone()));
+    let mut history_entries_written: usize = 0;
+
+    // Initialize FDR family for promotion ladder
+    let mut fdr_family = FdrFamily::new();
+    let mut promoted_l2_count: usize = 0;
+    let mut promoted_l3_count: usize = 0;
 
     let mut success_count: usize = 0;
     let mut error_count: usize = 0;
@@ -314,6 +358,88 @@ pub fn run_yolo(
                         continue;
                     }
 
+                    // Insert into cross-symbol leaderboard
+                    cross_leaderboard.insert_result(
+                        &symbol,
+                        backtest_result.metrics.clone(),
+                        &backtest_result.equity_curve,
+                        &strategy_config,
+                        &session_id,
+                        iteration,
+                        now,
+                    );
+
+                    // Thread stickiness into cross-symbol leaderboard
+                    let full_hash = strategy_config.full_hash();
+                    if let Some(ref stickiness) = backtest_result.stickiness {
+                        cross_leaderboard.set_stickiness(
+                            &full_hash,
+                            &symbol,
+                            stickiness.clone(),
+                        );
+                    }
+
+                    // Run promotion ladder if configured
+                    if let Some(ref promo_config) = config.promotion_config {
+                        let robustness = promote(
+                            &backtest_result,
+                            &strategy_config,
+                            &data.aligned,
+                            &symbol,
+                            config.trading_mode,
+                            config.initial_capital,
+                            config.position_size_pct,
+                            iter_preset,
+                            &data.dataset_hash,
+                            promo_config,
+                            &mut fdr_family,
+                        );
+
+                        match robustness.level_reached {
+                            PromotionLevel::Level2WalkForward => promoted_l2_count += 1,
+                            PromotionLevel::Level3ExecutionMc => {
+                                promoted_l2_count += 1;
+                                promoted_l3_count += 1;
+                            }
+                            _ => {}
+                        }
+
+                        cross_leaderboard.set_robustness(&full_hash, robustness);
+                    }
+
+                    // Build and persist fingerprint if history is enabled
+                    if let Some(ref hist) = history {
+                        let fingerprint = RunFingerprint {
+                            run_id: RunId::from_bytes(
+                                format!("yolo-{}-{}-{}", config.master_seed, iteration, symbol)
+                                    .as_bytes(),
+                            ),
+                            timestamp: now,
+                            seed: config.master_seed,
+                            symbol: symbol.clone(),
+                            start_date: config.start_date,
+                            end_date: config.end_date,
+                            trading_mode: config.trading_mode,
+                            initial_capital: config.initial_capital,
+                            strategy_config: strategy_config.clone(),
+                            config_hash: strategy_config.config_hash(),
+                            full_hash: strategy_config.full_hash(),
+                            dataset_hash: DatasetHash::from_bytes(data.dataset_hash.as_bytes()),
+                        };
+
+                        let entry = HistoryEntry {
+                            fingerprint,
+                            metrics: backtest_result.metrics.clone(),
+                            trade_count: backtest_result.trades.len(),
+                            fitness_score: fitness,
+                        };
+
+                        if let Ok(true) = hist.append(&entry) {
+                            history_entries_written += 1;
+                        }
+                    }
+
+                    // Insert into per-symbol leaderboard
                     let entry = LeaderboardEntry {
                         result: backtest_result,
                         fitness_score: fitness,
@@ -349,6 +475,12 @@ pub fn run_yolo(
                     0.0
                 };
 
+                let hist_size_mb = history
+                    .as_ref()
+                    .and_then(|h| h.file_size_bytes().ok())
+                    .unwrap_or(0) as f64
+                    / (1024.0 * 1024.0);
+
                 cb(&YoloProgress {
                     iteration,
                     current_symbol: String::new(),
@@ -359,6 +491,11 @@ pub fn run_yolo(
                     throughput_per_min: throughput,
                     leaderboard_entries: total_lb_entries,
                     elapsed_secs: elapsed,
+                    cross_leaderboard_entries: cross_leaderboard.len(),
+                    history_file_size_mb: hist_size_mb,
+                    promoted_l2_count,
+                    promoted_l3_count,
+                    fdr_family_size: fdr_family.len(),
                 });
                 last_progress = Instant::now();
             }
@@ -369,12 +506,23 @@ pub fn run_yolo(
 
     let elapsed = start_time.elapsed().as_secs_f64();
 
+    let history_file_size_bytes = history
+        .as_ref()
+        .and_then(|h| h.file_size_bytes().ok())
+        .unwrap_or(0);
+
     Ok(YoloResult {
         leaderboards,
+        cross_leaderboard,
         iterations_completed: iteration,
         success_count,
         error_count,
         elapsed_secs: elapsed,
+        history_entries_written,
+        history_file_size_bytes,
+        promoted_l2_count,
+        promoted_l3_count,
+        fdr_family_size: fdr_family.len(),
     })
 }
 

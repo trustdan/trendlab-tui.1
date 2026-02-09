@@ -253,7 +253,7 @@ pub fn avg_losing_streak(trades: &[TradeRecord]) -> f64 {
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /// Compute daily returns from an equity curve.
-fn daily_returns(equity_curve: &[f64]) -> Vec<f64> {
+pub fn daily_returns(equity_curve: &[f64]) -> Vec<f64> {
     if equity_curve.len() < 2 {
         return Vec::new();
     }
@@ -269,14 +269,14 @@ fn daily_returns(equity_curve: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn mean_f64(values: &[f64]) -> f64 {
+pub(crate) fn mean_f64(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
     values.iter().sum::<f64>() / values.len() as f64
 }
 
-fn std_dev(values: &[f64]) -> f64 {
+pub(crate) fn std_dev(values: &[f64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
     }

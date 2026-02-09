@@ -216,6 +216,7 @@ mod tests {
                 warmup_bars: 50,
                 void_bar_rates: HashMap::new(),
                 data_quality_warnings: vec![],
+                stickiness: None,
             },
             fitness_score: sharpe,
             iteration,

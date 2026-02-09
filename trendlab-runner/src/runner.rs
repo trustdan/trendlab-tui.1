@@ -1,8 +1,10 @@
 //! Backtest runner — wires together composition, engine, and metrics.
 //!
-//! Two entry points:
+//! Three entry points:
 //! - `run_single_backtest()`: loads data from cache, then runs. Used by CLI.
-//! - `run_backtest_from_data()`: takes pre-loaded data. Used by YOLO mode.
+//! - `run_backtest_from_data()`: takes pre-loaded data + execution preset. Used by YOLO mode.
+//! - `run_backtest_with_exec_config()`: takes pre-loaded data + explicit ExecutionConfig.
+//!   Used by execution Monte Carlo.
 
 use std::collections::HashMap;
 
@@ -16,6 +18,7 @@ use trendlab_core::data::align::AlignedData;
 use trendlab_core::data::cache::ParquetCache;
 use trendlab_core::data::provider::DataProvider;
 use trendlab_core::domain::TradeRecord;
+use trendlab_core::engine::stickiness::StickinessMetrics;
 use trendlab_core::engine::{run_backtest, EngineConfig, ExecutionConfig};
 use trendlab_core::fingerprint::{StrategyConfig, TradingMode};
 
@@ -54,6 +57,8 @@ pub struct BacktestResult {
     pub warmup_bars: usize,
     pub void_bar_rates: HashMap<String, f64>,
     pub data_quality_warnings: Vec<String>,
+    /// Stickiness diagnostics from the position manager (None if zero trades).
+    pub stickiness: Option<StickinessMetrics>,
 }
 
 /// Run a single backtest from a BacktestConfig (loads data from cache).
@@ -100,6 +105,35 @@ pub fn run_backtest_from_data(
     dataset_hash: &str,
     has_synthetic: bool,
 ) -> Result<BacktestResult, RunError> {
+    run_backtest_with_exec_config(
+        strategy_config,
+        aligned,
+        symbol,
+        trading_mode,
+        initial_capital,
+        position_size_pct,
+        ExecutionConfig::from_preset(execution_preset),
+        dataset_hash,
+        has_synthetic,
+    )
+}
+
+/// Run a backtest with pre-loaded data and an explicit ExecutionConfig.
+///
+/// Used by execution Monte Carlo to test varying slippage/commission parameters.
+/// Same as `run_backtest_from_data` but takes `ExecutionConfig` directly.
+#[allow(clippy::too_many_arguments)]
+pub fn run_backtest_with_exec_config(
+    strategy_config: &StrategyConfig,
+    aligned: &AlignedData,
+    symbol: &str,
+    trading_mode: TradingMode,
+    initial_capital: f64,
+    position_size_pct: f64,
+    exec_config: ExecutionConfig,
+    dataset_hash: &str,
+    has_synthetic: bool,
+) -> Result<BacktestResult, RunError> {
     // Verify symbol exists in aligned data
     if !aligned.bars.contains_key(symbol) {
         return Err(RunError::SymbolNotFound(symbol.to_string()));
@@ -115,7 +149,7 @@ pub fn run_backtest_from_data(
     let mut engine_config = EngineConfig::with_execution(
         initial_capital,
         0, // warmup computed from indicator lookbacks
-        ExecutionConfig::from_preset(execution_preset),
+        exec_config,
     );
     engine_config.trading_mode = trading_mode;
     engine_config.position_size_pct = position_size_pct;
@@ -172,6 +206,7 @@ pub fn run_backtest_from_data(
         warmup_bars: result.warmup_bars,
         void_bar_rates: result.void_bar_rates,
         data_quality_warnings: result.data_quality_warnings,
+        stickiness: result.stickiness,
     })
 }
 

@@ -4,10 +4,12 @@
 //! that never exit because the stop keeps chasing the price. These metrics
 //! quantify the problem and flag pathological configurations.
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::TradeRecord;
 
 /// Stickiness metrics computed for a backtest run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StickinessMetrics {
     /// Median holding period in bars.
     pub median_holding_bars: f64,
