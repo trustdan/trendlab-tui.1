@@ -1,20 +1,22 @@
-//! TrendLab CLI — download and run commands.
+//! TrendLab CLI — download, run, and cache management commands.
 //!
 //! Commands:
 //! - `download` — fetch market data from Yahoo Finance and cache as Parquet
 //! - `run` — execute a backtest from a TOML config file or named preset
+//! - `cache status` — report cache size, symbol count, date ranges
+//! - `cache clean` — remove symbols not accessed recently
 
 use anyhow::{bail, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trendlab_core::components::composition::StrategyPreset;
 use trendlab_core::data::{
     download_symbols, CircuitBreaker, ParquetCache, StdoutProgress, YahooProvider,
 };
-use trendlab_runner::runner::{run_single_backtest, BacktestResult};
-use trendlab_runner::{BacktestConfig, LoadOptions};
+use trendlab_runner::runner::run_single_backtest;
+use trendlab_runner::{save_artifacts, BacktestConfig, BacktestResult, LoadOptions};
 
 #[derive(Parser)]
 #[command(
@@ -88,6 +90,35 @@ enum Commands {
         #[arg(long, default_value = "results")]
         output_dir: PathBuf,
     },
+    /// Cache management commands.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Report cache size, symbol count, and date ranges.
+    Status {
+        /// Cache directory. Defaults to ./data.
+        #[arg(long, default_value = "data")]
+        cache_dir: PathBuf,
+    },
+    /// Remove cached symbols not accessed within the given number of days.
+    Clean {
+        /// Remove symbols not accessed in this many days.
+        #[arg(long)]
+        unused_days: u64,
+
+        /// Cache directory. Defaults to ./data.
+        #[arg(long, default_value = "data")]
+        cache_dir: PathBuf,
+
+        /// Actually delete (without this flag, only previews what would be removed).
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -114,6 +145,14 @@ fn main() -> Result<()> {
         } => run_backtest_cmd(
             config, preset, symbol, start, end, offline, synthetic, cache_dir, output_dir,
         ),
+        Commands::Cache { action } => match action {
+            CacheAction::Status { cache_dir } => run_cache_status(&cache_dir),
+            CacheAction::Clean {
+                unused_days,
+                cache_dir,
+                confirm,
+            } => run_cache_clean(&cache_dir, unused_days, confirm),
+        },
     }
 }
 
@@ -211,8 +250,9 @@ fn run_backtest_cmd(
     // Print summary
     print_summary(&result);
 
-    // Save result as JSON
-    save_result(&result, &output_dir)?;
+    // Save full artifact set (manifest.json, trades.csv, equity.csv)
+    let run_dir = save_artifacts(&result, &output_dir)?;
+    println!("Artifacts saved to: {}", run_dir.display());
 
     Ok(())
 }
@@ -285,6 +325,162 @@ fn format_params(section: &str, params: &std::collections::BTreeMap<String, f64>
     format!("[{section}.params]\n{}", pairs.join("\n"))
 }
 
+fn run_cache_status(cache_dir: &Path) -> Result<()> {
+    if !cache_dir.exists() {
+        println!("Cache directory does not exist: {}", cache_dir.display());
+        return Ok(());
+    }
+
+    let mut total_size: u64 = 0;
+    let mut symbol_count = 0;
+
+    let entries = std::fs::read_dir(cache_dir)?;
+    let mut rows: Vec<(String, String, String, u64)> = Vec::new();
+
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("symbol=") {
+            continue;
+        }
+
+        let symbol = name.trim_start_matches("symbol=").to_string();
+        symbol_count += 1;
+
+        // Read metadata
+        let meta_path = entry.path().join("meta.json");
+        let (date_range, bar_count) = if let Ok(content) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) =
+                serde_json::from_str::<trendlab_core::data::cache::CacheMeta>(&content)
+            {
+                (
+                    format!("{} to {}", meta.start_date, meta.end_date),
+                    meta.bar_count,
+                )
+            } else {
+                ("(corrupt meta)".into(), 0)
+            }
+        } else {
+            ("(no meta)".into(), 0)
+        };
+
+        // Calculate directory size
+        let dir_size = dir_size(&entry.path());
+        total_size += dir_size;
+
+        rows.push((symbol, date_range, format!("{bar_count} bars"), dir_size));
+    }
+
+    if symbol_count == 0 {
+        println!("Cache is empty: {}", cache_dir.display());
+        return Ok(());
+    }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    println!("Cache: {}", cache_dir.display());
+    println!("Symbols: {symbol_count}");
+    println!("Total size: {}", format_size(total_size));
+    println!();
+    println!("{:<8} {:<25} {:<12} {:>10}", "Symbol", "Date Range", "Bars", "Size");
+    println!("{}", "-".repeat(58));
+    for (sym, range, bars, size) in &rows {
+        println!("{:<8} {:<25} {:<12} {:>10}", sym, range, bars, format_size(*size));
+    }
+
+    Ok(())
+}
+
+fn run_cache_clean(cache_dir: &Path, unused_days: u64, confirm: bool) -> Result<()> {
+    if !cache_dir.exists() {
+        println!("Cache directory does not exist: {}", cache_dir.display());
+        return Ok(());
+    }
+
+    let cutoff = chrono::Local::now().naive_local()
+        - chrono::Duration::days(unused_days as i64);
+
+    let entries = std::fs::read_dir(cache_dir)?;
+    let mut to_remove: Vec<(String, PathBuf)> = Vec::new();
+
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("symbol=") {
+            continue;
+        }
+
+        let symbol = name.trim_start_matches("symbol=").to_string();
+        let meta_path = entry.path().join("meta.json");
+
+        let should_remove = if let Ok(content) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) =
+                serde_json::from_str::<trendlab_core::data::cache::CacheMeta>(&content)
+            {
+                meta.cached_at < cutoff
+            } else {
+                false // don't remove if we can't parse metadata
+            }
+        } else {
+            false
+        };
+
+        if should_remove {
+            to_remove.push((symbol, entry.path()));
+        }
+    }
+
+    if to_remove.is_empty() {
+        println!("No symbols older than {unused_days} days to remove.");
+        return Ok(());
+    }
+
+    println!(
+        "Found {} symbol(s) not accessed in {unused_days} days:",
+        to_remove.len()
+    );
+    for (sym, path) in &to_remove {
+        let size = dir_size(path);
+        println!("  {sym} ({})", format_size(size));
+    }
+
+    if !confirm {
+        println!();
+        println!("Dry run — pass --confirm to actually delete.");
+        return Ok(());
+    }
+
+    for (sym, path) in &to_remove {
+        std::fs::remove_dir_all(path)?;
+        println!("Removed: {sym}");
+    }
+
+    println!("Done. Removed {} symbol(s).", to_remove.len());
+    Ok(())
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut size = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                size += meta.len();
+            }
+        }
+    }
+    size
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 fn print_summary(result: &BacktestResult) {
     println!();
     println!("=== Backtest Result ===");
@@ -329,16 +525,3 @@ fn print_summary(result: &BacktestResult) {
     println!();
 }
 
-fn save_result(result: &BacktestResult, output_dir: &PathBuf) -> Result<()> {
-    std::fs::create_dir_all(output_dir)?;
-    let filename = format!(
-        "{}_{}.json",
-        result.symbol,
-        chrono::Local::now().format("%Y%m%d_%H%M%S")
-    );
-    let path = output_dir.join(filename);
-    let json = serde_json::to_string_pretty(result)?;
-    std::fs::write(&path, json)?;
-    println!("Result saved to: {}", path.display());
-    Ok(())
-}

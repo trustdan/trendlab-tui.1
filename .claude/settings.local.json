@@ -26,7 +26,9 @@
       "Bash(git commit:*)",
       "Bash(dir:*)",
       "Bash(for f in \"c:\\\\Users\\\\Dan\\\\trendlab-tui.1\\\\trendlab-runner\\\\src\"/*.rs)",
-      "Bash(do wc -l \"$f\")"
+      "Bash(do wc -l \"$f\")",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:ratatui.rs)"
     ]
   }
 }

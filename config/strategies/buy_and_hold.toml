@@ -1,0 +1,26 @@
+# Buy-and-Hold Benchmark
+#
+# Uses a very short Donchian breakout (period 2) to enter quickly,
+# then no_op PM to never exit. This approximates a buy-and-hold benchmark
+# for comparison against active strategies.
+
+[backtest]
+symbol = "SPY"
+start_date = "2020-01-02"
+end_date = "2024-12-31"
+initial_capital = 100000.0
+trading_mode = "long_only"
+position_size_pct = 1.0
+
+[signal]
+type = "donchian_breakout"
+[signal.params]
+entry_lookback = 2.0
+
+[position_manager]
+type = "no_op"
+
+[execution_model]
+type = "next_bar_open"
+[execution_model.params]
+preset = 1.0

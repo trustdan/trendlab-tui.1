@@ -39,9 +39,15 @@ pub enum RunError {
     SymbolNotFound(String),
 }
 
+/// Current schema version for persisted artifacts.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// Complete result of a single backtest run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestResult {
+    /// Schema version for forward-compatible deserialization.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub metrics: PerformanceMetrics,
     pub trades: Vec<TradeRecord>,
     pub equity_curve: Vec<f64>,
@@ -59,6 +65,11 @@ pub struct BacktestResult {
     pub data_quality_warnings: Vec<String>,
     /// Stickiness diagnostics from the position manager (None if zero trades).
     pub stickiness: Option<StickinessMetrics>,
+}
+
+/// Default schema version for serde deserialization of older JSON without the field.
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
 }
 
 /// Run a single backtest from a BacktestConfig (loads data from cache).
@@ -191,6 +202,7 @@ pub fn run_backtest_with_exec_config(
         .unwrap_or_default();
 
     Ok(BacktestResult {
+        schema_version: SCHEMA_VERSION,
         metrics,
         trades,
         equity_curve: result.equity_curve,

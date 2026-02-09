@@ -14,6 +14,7 @@ pub mod config;
 pub mod cross_leaderboard;
 pub mod data_loader;
 pub mod execution_mc;
+pub mod export;
 pub mod fdr;
 pub mod fitness;
 pub mod history;
@@ -34,6 +35,10 @@ pub use config::{BacktestConfig, ConfigError};
 pub use cross_leaderboard::{AggregatedStickiness, CrossSymbolEntry, CrossSymbolLeaderboard};
 pub use data_loader::{load_bars, LoadError, LoadOptions, LoadedData};
 pub use execution_mc::{ExecutionMcConfig, ExecutionMcResult, McSample, StabilityScore};
+pub use export::{
+    export_equity_csv, export_json, export_trades_csv, generate_comparison, generate_report,
+    import_json, load_artifacts, save_artifacts,
+};
 pub use fdr::{benjamini_hochberg, FdrFamily, FdrResult, TTestResult};
 pub use fitness::FitnessMetric;
 pub use history::{ComponentSummary, HistoryEntry, WriteFilter, YoloHistory};
@@ -41,7 +46,7 @@ pub use leaderboard::{InsertResult, LeaderboardEntry, SymbolLeaderboard};
 pub use metrics::PerformanceMetrics;
 pub use promotion::{PromotionConfig, PromotionLevel, RobustnessResult};
 pub use risk_profile::{RankingMetric, RiskProfile};
-pub use runner::{run_backtest_from_data, run_single_backtest, BacktestResult, RunError};
+pub use runner::{run_backtest_from_data, run_single_backtest, BacktestResult, RunError, SCHEMA_VERSION};
 pub use tail_metrics::TailMetrics;
 pub use walk_forward::{
     DegradationFlag, WalkForwardConfig, WalkForwardResult,

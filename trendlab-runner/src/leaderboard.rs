@@ -201,6 +201,7 @@ mod tests {
         let metrics = make_metrics(sharpe);
         LeaderboardEntry {
             result: BacktestResult {
+                schema_version: 1,
                 metrics: metrics.clone(),
                 trades: vec![],
                 equity_curve: vec![100_000.0],

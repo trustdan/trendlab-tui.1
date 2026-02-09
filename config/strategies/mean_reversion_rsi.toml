@@ -1,0 +1,36 @@
+# Mean Reversion RSI Strategy
+#
+# Counter-trend: buy when RSI is oversold (ROC negative), sell on recovery.
+# Uses TSMOM signal in reversal mode with a tight fixed stop-loss.
+# Best on range-bound markets. High turnover.
+
+[backtest]
+symbol = "SPY"
+start_date = "2020-01-02"
+end_date = "2024-12-31"
+initial_capital = 100000.0
+trading_mode = "long_only"
+position_size_pct = 1.0
+
+[signal]
+type = "tsmom"
+[signal.params]
+lookback = 20.0
+signal_threshold = -0.02
+
+[position_manager]
+type = "fixed_stop_loss"
+[position_manager.params]
+stop_pct = 0.03
+
+[execution_model]
+type = "next_bar_open"
+[execution_model.params]
+preset = 1.0
+
+[signal_filter]
+type = "volatility_filter"
+[signal_filter.params]
+period = 14.0
+min_pct = 0.5
+max_pct = 4.0
